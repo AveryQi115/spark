@@ -69,6 +69,18 @@ trait ShuffleExchangeLike extends Exchange {
    */
   def shuffleOrigin: ShuffleOrigin
 
+  /**
+   * Whether this shuffle was inserted to guarantee CTE (subplan) reuse.
+   *
+   * When true, shuffle-planning rules must treat this exchange as immutable so that all
+   * references to the same CTE stay canonically equal and dedup into a single
+   * `ReusedExchangeExec`. In particular `EnsureRequirements` must not rewrite its
+   * partitioning in place; a consumer needing a different partitioning wraps it in a new
+   * shuffle instead. A shuffle qualifies when it carries the `LOCAL_SHUFFLE_FOR_CTE`
+   * origin, which is only produced for CTE reuse.
+   */
+  def isCreatedForSubplanReuse: Boolean = shuffleOrigin.isInstanceOf[LOCAL_SHUFFLE_FOR_CTE]
+
   @transient
   private lazy val promise = Promise[MapOutputStatistics]()
 
