@@ -1241,6 +1241,14 @@ case class AdaptiveExecutionContext(session: SparkSession, qe: QueryExecution) {
   val stageCache: TrieMap[SparkPlan, ExchangeQueryStageExec] =
     new TrieMap[SparkPlan, ExchangeQueryStageExec]()
 
+  /**
+   * Registry of the shared inner [[AdaptiveSparkPlanExec]] for each reused CTE, keyed by `cteId`.
+   * Populated by `PlanCTEReuse` (AQE on): all references to one CTE wrap the same inner AQE so the
+   * CTE body is materialized once and shared. Shared across the main query and its sub-queries.
+   */
+  val cteAQERegistry: TrieMap[Long, AdaptiveSparkPlanExec] =
+    new TrieMap[Long, AdaptiveSparkPlanExec]()
+
   private val stageLifecycleLock = new Object
 
   /**

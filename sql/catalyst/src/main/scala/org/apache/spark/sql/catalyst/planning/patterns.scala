@@ -167,6 +167,63 @@ object NodeWithOnlyDeterministicProjectAndFilter {
 }
 
 /**
+ * A pattern that peels off the shape-preserving unary nodes above a repartition's leaf and
+ * returns the first node below them. It descends through [[Project]] / [[Filter]], all of
+ * which preserve the distribution a partial shuffle relies on. It returns the input plan
+ * itself when there is no such wrapper.
+ *
+ * Callers decide validity by matching the returned node. Used by repartition plan-shape checks.
+ */
+object NodeWithProjectFilterAboveReusedSubplan {
+  @scala.annotation.tailrec
+  def unapply(plan: LogicalPlan): Option[LogicalPlan] = plan match {
+    case p: Project => unapply(p.child)
+    case f: Filter => unapply(f.child)
+    case rbe: RepartitionByExpression if rbe.repartitionId > 0 => Some(rbe)
+    case r: Repartition if r.repartitionId > 0 => Some(r)
+    case _ => None
+  }
+}
+
+/**
+ * A pattern that matches a subplan for reuse with operators that have distribution requirement
+ * above it, including aggregates, windows, and equi-joins which are estimated to not be planned
+ * as broadcast hash joins.
+ */
+object NodeWithDistributionRequirementsAboveReusedSubplans extends JoinSelectionHelper {
+
+  def unapply(plan: LogicalPlan): Option[Seq[(Option[LogicalPlan], LogicalPlan)]] = {
+    plan match {
+      // A plain Aggregate imposes a clustered distribution on its input.
+      case agg: Aggregate if agg.groupingExpressions.nonEmpty =>
+        pairs(agg, Seq(agg.child))
+      case w: Window if w.partitionSpec.nonEmpty =>
+        pairs(w, Seq(w.child))
+      case j @ ExtractEquiJoinKeys(_, _, _, _, _, left, right, _)
+          if !canPlanAsBroadcastHashJoin(j, SQLConf.get) =>
+        pairs(j, Seq(left, right))
+      // A reused subplan with nothing above it that requires a clustering. Matched last so a
+      // requiring consumer above always takes precedence.
+      case rbe: RepartitionByExpression if rbe.repartitionId > 0 && rbe.partitionExpressions.nonEmpty =>
+        val ownRequirement = Some(rbe)
+        Some(Seq((ownRequirement, rbe)))
+      case r: Repartition if r.repartitionId > 0 =>
+        Some(Seq((None, r)))
+      case _ => None
+    }
+  }
+
+  private def pairs(
+      requirement: LogicalPlan,
+      children: Seq[LogicalPlan]): Option[Seq[(Option[LogicalPlan], LogicalPlan)]] = {
+    val found = children.collect {
+      case NodeWithProjectFilterAboveReusedSubplan(r) => (Some(requirement), r)
+    }
+    if (found.isEmpty) None else Some(found)
+  }
+}
+
+/**
  * A pattern that finds joins with equality conditions that can be evaluated using equi-join.
  *
  * Null-safe equality will be transformed into equality as joining key (replace null with default

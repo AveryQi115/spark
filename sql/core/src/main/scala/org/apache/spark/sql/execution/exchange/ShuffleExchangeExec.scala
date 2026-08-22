@@ -184,6 +184,10 @@ case object REBALANCE_PARTITIONS_BY_COL extends ShuffleOrigin
 // change it.
 case object REQUIRED_BY_STATEFUL_OPERATOR extends ShuffleOrigin
 
+// Indicates that the shuffle operator facilitates CTE reuse. The `cteId` identifies
+// the CTE definition being reused across multiple references.
+case class LOCAL_SHUFFLE_FOR_CTE(cteId: Long) extends ShuffleOrigin
+
 /**
  * Performs a shuffle that will result in the desired partitioning.
  */
