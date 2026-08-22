@@ -2215,14 +2215,99 @@ abstract class RepartitionOperation extends UnaryNode {
 }
 
 /**
+ * Generator for unique Repartition IDs within a query, used to correlate the references of a
+ * plan-reuse repartition so they can be materialized once and shared (see [[PlanReusableRepartition]]).
+ */
+object RepartitionIdGenerator {
+  private val curId = new java.util.concurrent.atomic.AtomicLong(1)
+  def newRepartitionId: Long = curId.getAndIncrement()
+}
+
+/**
+ * Enumeration representing the origin of a plan-reuse Repartition node.
+ */
+object RepartitionOrigin extends Enumeration {
+  type RepartitionOrigin = Value
+  val Unknown = Value
+  val Decorrelation = Value
+  val MultiDistinctAgg = Value
+  val ReuseSubplan = Value
+  val TopKUnionBranch = Value
+}
+
+/**
+ * A trait for repartition operations that support plan reuse. Repartitions marked for plan reuse
+ * carry a unique id (used to guarantee exchange reuse across references) and track their origin.
+ */
+trait PlanReusableRepartition extends RepartitionOperation {
+  /**
+   * Unique identifier for this repartition node, used for plan reuse.
+   * A value of 0 indicates this repartition is not used for plan reuse.
+   */
+  def repartitionId: Long
+
+  /**
+   * The origin/reason this repartition was created.
+   */
+  def repartitionOrigin: RepartitionOrigin.Value
+
+  /**
+   * Whether this repartition is used for plan reuse (CTE, decorrelation, etc.).
+   * True when repartitionId is non-zero.
+   */
+  def isForPlanReuse: Boolean = repartitionId != 0L
+
+  /**
+   * Creates a copy of this repartition with a new id.
+   */
+  def withRepartitionId(newId: Long): PlanReusableRepartition
+
+  /**
+   * Assigns a new repartition id (or reassigns if already set).
+   * @param reassign If true, reassigns a new id even if one is already assigned.
+   */
+  def addRepartitionId(reassign: Boolean = false): PlanReusableRepartition = {
+    if (reassign || repartitionId == 0L) {
+      withRepartitionId(RepartitionIdGenerator.newRepartitionId)
+    } else {
+      this
+    }
+  }
+}
+
+/**
  * Returns a new RDD that has exactly `numPartitions` partitions. Differs from
  * [[RepartitionByExpression]] as this method is called directly by DataFrame's, because the user
  * asked for `coalesce` or `repartition`. [[RepartitionByExpression]] is used when the consumer
  * of the output requires some specific ordering or distribution of the data.
  */
-case class Repartition(numPartitions: Int, shuffle: Boolean, child: LogicalPlan)
-  extends RepartitionOperation {
+case class Repartition(
+    numPartitions: Int,
+    shuffle: Boolean,
+    child: LogicalPlan,
+    localShuffle: Boolean = false,
+    id: Long = 0,
+    repartitionOrigin: RepartitionOrigin.Value = RepartitionOrigin.Unknown)
+  extends RepartitionOperation with PlanReusableRepartition {
   require(numPartitions > 0, s"Number of partitions ($numPartitions) must be positive.")
+
+  // Implement PlanReusableRepartition by delegating to `id`.
+  override def repartitionId: Long = id
+
+  override def addRepartitionId(reassign: Boolean = false): Repartition = {
+    if (localShuffle && (reassign || id == 0)) {
+      this.copy(id = RepartitionIdGenerator.newRepartitionId)
+    } else {
+      this
+    }
+  }
+
+  override def withRepartitionId(newId: Long): Repartition = {
+    if (localShuffle) this.copy(id = newId) else this
+  }
+
+  // A plan-reuse repartition has localShuffle set and a non-zero id.
+  override val isForPlanReuse: Boolean = localShuffle && id != 0L
 
   override def partitioning: Partitioning = {
     require(shuffle, "Partitioning can only be used in shuffle.")
@@ -2287,8 +2372,10 @@ case class RepartitionByExpression(
     partitionExpressions: Seq[Expression],
     child: LogicalPlan,
     optNumPartitions: Option[Int],
-    optAdvisoryPartitionSize: Option[Long] = None)
-  extends RepartitionOperation with HasPartitionExpressions {
+    optAdvisoryPartitionSize: Option[Long] = None,
+    id: Long = 0,
+    repartitionOrigin: RepartitionOrigin.Value = RepartitionOrigin.Unknown)
+  extends RepartitionOperation with HasPartitionExpressions with PlanReusableRepartition {
 
   require(optNumPartitions.isEmpty || optAdvisoryPartitionSize.isEmpty)
 
@@ -2301,6 +2388,11 @@ case class RepartitionByExpression(
   }
 
   override def shuffle: Boolean = true
+
+  // Implement PlanReusableRepartition by delegating to `id`.
+  override def repartitionId: Long = id
+
+  override def withRepartitionId(newId: Long): RepartitionByExpression = this.copy(id = newId)
 
   override protected def withNewChildInternal(newChild: LogicalPlan): RepartitionByExpression =
     copy(child = newChild)

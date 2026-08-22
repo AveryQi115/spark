@@ -30,8 +30,7 @@ import org.apache.spark.sql.internal.SQLConf
  *
  * By the time this runs, [[ReplaceCTERefWithRepartition]] has already turned CTE references into
  * plan-reuse repartitions (a [[Repartition]] / [[RepartitionByExpression]] carrying a non-zero
- * `repartitionId`), and [[OptimizePartitioning]] may have upgraded some of them from a
- * `LocalPartition` repartition to a `RepartitionByExpression`. This rule seals every plan-reuse
+ * `repartitionId`). This rule seals every plan-reuse
  * repartition -- the ones from CTE references as well as any pre-existing ones from decorrelation,
  * multi-distinct aggregate, or subplan reuse -- into a [[CTEReuseRelation]].
  *

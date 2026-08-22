@@ -109,7 +109,6 @@ class SparkOptimizer(
       EliminateLimits),
     Batch("User Provided Optimizers", fixedPoint, experimentalMethods.extraOptimizations: _*),
     Batch("Replace CTE with Repartition", Once, ReplaceCTERefWithRepartition),
-    Batch("Optimize CTE Partitioning", Once, OptimizePartitioning),
     Batch("Replace Repartition with CTE Reuse", Once, ReplaceRepartitionWithCTEReuse),
     // Must run last: it inspects the final plan shape to mark scans that can run in a single task,
     // and no subsequent rule should reshape the plan or copy the marked scan nodes.

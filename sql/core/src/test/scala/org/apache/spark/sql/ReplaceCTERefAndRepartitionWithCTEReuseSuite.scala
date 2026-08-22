@@ -19,9 +19,9 @@ package org.apache.spark.sql
 
 import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
-import org.apache.spark.sql.catalyst.optimizer.{OptimizePartitioning, ReplaceCTERefWithRepartition, ReplaceRepartitionWithCTEReuse}
+import org.apache.spark.sql.catalyst.optimizer.{ReplaceCTERefWithRepartition, ReplaceRepartitionWithCTEReuse}
 import org.apache.spark.sql.catalyst.plans.logical._
-import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, LocalPartition}
+import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.execution.ExtendedMode
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -48,7 +48,7 @@ class ReplaceCTERefAndRepartitionWithCTEReuseSuite
       cteReuseConfKey -> "true",
       localShuffleConfKey -> "true",
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true") {
-    ReplaceRepartitionWithCTEReuse(OptimizePartitioning(ReplaceCTERefWithRepartition(plan)))
+    ReplaceRepartitionWithCTEReuse(ReplaceCTERefWithRepartition(plan))
   }
 
   // Both flags on so the CTE-ref rules use AssignNewExprIds (which mints fresh per-reference
@@ -432,63 +432,4 @@ class ReplaceCTERefAndRepartitionWithCTEReuseSuite
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // OptimizePartitioning: the references of one repartition id must all have a
-  // detected, agreeing requirement before the reuse shuffle is partitioned.
-  // ---------------------------------------------------------------------------
-
-  private def runOptimizePartitioning(plan: LogicalPlan): LogicalPlan =
-    withSQLConf(cteReuseConfKey -> "true") {
-      OptimizePartitioning(plan)
-    }
-
-  // (RepartitionByExpression count, plan-reuse Repartition count) after the rule.
-  private def planReuseRepartitionCounts(plan: LogicalPlan): (Int, Int) = (
-    plan.collect { case r: RepartitionByExpression if r.isForPlanReuse => r }.size,
-    plan.collect { case r: Repartition if r.isForPlanReuse => r }.size)
-
-  test("a reference with no requirement above it is not transformed") {
-    // Branch 1's repartition has a requirement (the aggregate); branch 2's repartition sits
-    // directly under the Union with no requirement. Not every consumer votes, so no upgrade.
-    val src = rel
-    val r1 = planReuseRepartition(src, id = 1L)
-    val agg = Aggregate(Seq(r1.output.head), Seq(r1.output.head), r1)
-    val r2 = planReuseRepartition(src, id = 1L)
-
-    val result = runOptimizePartitioning(Union(Seq(agg, r2)))
-
-    assert(planReuseRepartitionCounts(result) == (0, 2),
-      s"Expected both repartitions left as plan-reuse Repartition:\n${result.treeString}")
-  }
-
-  test("no consensus while a RepartitionByExpression consumer is present raises an error") {
-    // A RepartitionByExpression (which demands a specific partitioning) shares an id with a plain
-    // Repartition that has no requirement above it. The consumers cannot agree, and we cannot fall
-    // back to LocalPartition without breaking the RepartitionByExpression consumer -- an
-    // unreconcilable state that surfaces as an internal error.
-    val src = rel
-    val rbe = RepartitionByExpression(Seq(src.output.head), src, optNumPartitions = None, id = 1L)
-    val rep = planReuseRepartition(src, id = 1L)
-
-    val e = intercept[SparkException](runOptimizePartitioning(Union(Seq(rbe, rep))))
-    assert(e.getMessage.contains("do not agree on a partitioning"),
-      s"Expected a no-consensus-with-RepartitionByExpression error, got: ${e.getMessage}")
-  }
-
-  test("a requirement blocked by an Expand is treated as none, so not transformed") {
-    // Branch 2's aggregate requirement cannot reach the repartition through the Expand (Expand is
-    // not a node the walker crosses), so no clustering is detected for that reference and the
-    // fallback applies even though branch 1 does have a requirement.
-    val src = rel
-    val r1 = planReuseRepartition(src, id = 1L)
-    val agg1 = Aggregate(Seq(r1.output.head), Seq(r1.output.head), r1)
-    val r2 = planReuseRepartition(src, id = 1L)
-    val a2 = r2.output.head
-    val agg2 = Aggregate(Seq(a2), Seq(a2), Expand(Seq(Seq(a2)), Seq(a2), r2))
-
-    val result = runOptimizePartitioning(Union(Seq(agg1, agg2)))
-
-    assert(planReuseRepartitionCounts(result) == (0, 2),
-      s"Expected no transform when a requirement is blocked by Expand:\n${result.treeString}")
-  }
 }
