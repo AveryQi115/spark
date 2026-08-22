@@ -35,9 +35,9 @@ class CTEReuseWithoutAQESuite
     extends QueryTest with SharedSparkSession {
 
   private val cteReuseConf =
-    "spark.sql.optimizer.replaceCTERefWithCTEReuse"
+    "spark.sql.optimizer.replaceCTERefWithCTEReuse.enabled"
   private val localShuffleConf =
-    "spark.sql.optimizer.useLocalShuffleForCTEReuse"
+    "spark.sql.optimizer.useLocalShuffleForCTEReuse.enabled"
 
   private def withCTEReuseNoAQE(f: => Unit): Unit = {
     withSQLConf(
@@ -432,7 +432,7 @@ class CTEReuseWithoutAQESuite
           // governs whether that throws. Turn the flag off here so the query runs and we assert the
           // fallback: no reuse, the "reuse not applied" signal recorded, correct results.
           withSQLConf(
-            "spark.sql.optimizer.failOnCTEReuseWithoutAQENotApplied" -> "false") {
+            "spark.sql.optimizer.failOnCTEReuseWithoutAQE.enabled" -> "false") {
             val df = sql(
               """WITH cte AS (SELECT id, v, rand() as r FROM reuse_src)
                 |SELECT c1.id, c2.v FROM cte c1 JOIN cte c2 ON c1.id = c2.id

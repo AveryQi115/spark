@@ -38,8 +38,8 @@ class CTEReusePartitioningSuite extends QueryTest with SharedSparkSession
 
   private def withCTEReuse(f: => Unit): Unit = {
     withSQLConf(
-      "spark.sql.optimizer.replaceCTERefWithCTEReuse" -> "true",
-      "spark.sql.optimizer.useLocalShuffleForCTEReuse" -> "true",
+      "spark.sql.optimizer.replaceCTERefWithCTEReuse.enabled" -> "true",
+      "spark.sql.optimizer.useLocalShuffleForCTEReuse.enabled" -> "true",
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
       // Force shuffle joins: a broadcast join needs no clustered distribution, so its side
       // abstains from the partitioning vote.
@@ -208,8 +208,8 @@ class CTEReusePartitioningSuite extends QueryTest with SharedSparkSession
 
   test("broadcast join consumers abstain, leaving LocalPartition") {
     withSQLConf(
-      "spark.sql.optimizer.replaceCTERefWithCTEReuse" -> "true",
-      "spark.sql.optimizer.useLocalShuffleForCTEReuse" -> "true",
+      "spark.sql.optimizer.replaceCTERefWithCTEReuse.enabled" -> "true",
+      "spark.sql.optimizer.useLocalShuffleForCTEReuse.enabled" -> "true",
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
       // Large threshold: both joins are planned as broadcast, so neither requires a clustered
       // distribution and neither votes.
@@ -299,8 +299,8 @@ class CTEReusePartitioningSuite extends QueryTest with SharedSparkSession
 
   test("legacy path is unaffected when guaranteed reuse is disabled") {
     withSQLConf(
-      "spark.sql.optimizer.replaceCTERefWithCTEReuse" -> "false",
-      "spark.sql.optimizer.useLocalShuffleForCTEReuse" -> "true",
+      "spark.sql.optimizer.replaceCTERefWithCTEReuse.enabled" -> "false",
+      "spark.sql.optimizer.useLocalShuffleForCTEReuse.enabled" -> "true",
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1"
     ) {

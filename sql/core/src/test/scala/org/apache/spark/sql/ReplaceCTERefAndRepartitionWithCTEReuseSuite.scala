@@ -31,8 +31,8 @@ class ReplaceCTERefAndRepartitionWithCTEReuseSuite
     extends QueryTest with SharedSparkSession {
   import testImplicits._
 
-  private val cteReuseConfKey = "spark.sql.optimizer.replaceCTERefWithCTEReuse"
-  private val localShuffleConfKey = "spark.sql.optimizer.useLocalShuffleForCTEReuse"
+  private val cteReuseConfKey = "spark.sql.optimizer.replaceCTERefWithCTEReuse.enabled"
+  private val localShuffleConfKey = "spark.sql.optimizer.useLocalShuffleForCTEReuse.enabled"
 
   private def withCTEReuseEnabled(f: => Unit): Unit = {
     withSQLConf(
@@ -55,8 +55,8 @@ class ReplaceCTERefAndRepartitionWithCTEReuseSuite
   // exprIds -- the input the partitioning canonicalization fix must tolerate).
   private def withAssignNewExprIdsEnabled(f: => Unit): Unit = {
     withSQLConf(
-      "spark.sql.optimizer.assignNewExprIdsForCTEReuse" -> "true",
-      "spark.sql.optimizer.assignExprIdsRemapRuntimeFilters" -> "true"
+      "spark.sql.optimizer.assignNewExprIdsForCTEReuse.enabled" -> "true",
+      "spark.sql.optimizer.assignNewExprIds.remapRuntimeFilters.enabled" -> "true"
     )(f)
   }
 
