@@ -6783,6 +6783,55 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val REPLACE_CTE_REF_WITH_CTE_REUSE =
+    buildConf("spark.sql.optimizer.replaceCTERefWithCTEReuse.enabled")
+      .internal()
+      .doc("When true, replaces CTE references and repartitions with CTEReuse nodes " +
+        "instead of plain Repartition nodes. CTEReuse enables guaranteed exchange reuse " +
+        "in AQE by sharing a single inner AdaptiveSparkPlanExec across all references.")
+      .version("4.2.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  val ASSIGN_NEW_EXPR_IDS_FOR_CTE_REUSE =
+    buildConf("spark.sql.optimizer.assignNewExprIdsForCTEReuse.enabled")
+      .internal()
+      .doc("When true, uses AssignNewExprIds instead of DeduplicateRelations " +
+        "when deduplicating CTE references in ReplaceCTERefWithRepartition. Only effective " +
+        "when ASSIGN_EXPR_IDS_REMAP_RUNTIME_FILTERS is also true.")
+      .version("4.2.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  val USE_LOCAL_SHUFFLE_FOR_CTE_REUSE =
+    buildConf("spark.sql.optimizer.useLocalShuffleForCTEReuse.enabled")
+      .internal()
+      .doc("Uses Local shuffle instead of round robin for CTE reuse nodes.")
+      .version("4.2.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  val ASSIGN_EXPR_IDS_REMAP_RUNTIME_FILTERS =
+    buildConf("spark.sql.optimizer.assignNewExprIds.remapRuntimeFilters.enabled")
+      .internal()
+      .doc("When true, AssignNewExprIds remaps runtime filter expressions to the new expression " +
+        "IDs, preventing incorrect reference resolution.")
+      .version("4.2.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val FAIL_ON_CTE_REUSE_WITHOUT_AQE =
+    buildConf("spark.sql.optimizer.failOnCTEReuseWithoutAQE.enabled")
+      .internal()
+      .doc("When true, throw an error if guaranteed CTE/subplan shuffle reuse fails with AQE " +
+        "off, i.e. two or more shuffles tagged with the same cteId survive after " +
+        "ReuseExchangeAndSubquery (they were not deduplicated into a ReusedExchangeExec). " +
+        "When false, only log the plan, error, and cteIds. Enabled by default in tests to " +
+        "catch reuse regressions.")
+      .version("4.2.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val LEGACY_TIME_PARSER_POLICY = buildConf(SqlApiConfHelper.LEGACY_TIME_PARSER_POLICY_KEY)
     .internal()
     .doc("When LEGACY, java.text.SimpleDateFormat is used for formatting and parsing " +

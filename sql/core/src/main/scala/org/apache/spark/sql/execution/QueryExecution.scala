@@ -47,7 +47,7 @@ import org.apache.spark.sql.execution.adaptive.{AdaptiveExecutionContext, Insert
 import org.apache.spark.sql.execution.bucketing.{CoalesceBucketsInJoin, DisableUnnecessaryBucketedScan}
 import org.apache.spark.sql.execution.datasources.v2.{TransactionalExec, V2TableRefreshUtil}
 import org.apache.spark.sql.execution.dynamicpruning.PlanDynamicPruningFilters
-import org.apache.spark.sql.execution.exchange.EnsureRequirements
+import org.apache.spark.sql.execution.exchange.{EnsureRequirements, UnwrapCTEReuseExchange, VerifyCTEReuse}
 import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 import org.apache.spark.sql.execution.streaming.checkpointing.OffsetSeqMetadata
 import org.apache.spark.sql.execution.streaming.runtime.{IncrementalExecution, WatermarkPropagator}
@@ -769,6 +769,9 @@ object QueryExecution {
     Seq(
       CoalesceBucketsInJoin,
       PlanDynamicPruningFilters(sparkSession),
+      // Unwrap CTEReuseExchange nodes early in the pipeline (AQE off). Runs in both main and
+      // subquery passes so CTE references inside subqueries are also unwrapped.
+      UnwrapCTEReuseExchange,
       PlanSubqueries(sparkSession),
       RemoveRedundantProjects,
       EnsureRequirements(),
@@ -801,7 +804,9 @@ object QueryExecution {
       (if (subquery) {
         Nil
       } else {
-        Seq(ReuseExchangeAndSubquery)
+        // VerifyCTEReuse runs only on the main query (not per-subquery) after ReuseExchangeAndSubquery,
+        // to verify that guaranteed CTE shuffle reuse held (AQE off).
+        Seq(ReuseExchangeAndSubquery, VerifyCTEReuse(failOnReuseFailure = false))
       })
   }
 
