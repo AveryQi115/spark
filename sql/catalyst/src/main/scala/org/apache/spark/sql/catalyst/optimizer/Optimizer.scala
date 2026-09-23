@@ -67,7 +67,7 @@ abstract class Optimizer(catalogManager: CatalogManager)
     Set(
       "PartitionPruning",
       "RewriteSubquery",
-      "Extract Python UDFs",
+      "Extract UDFs",
       "Infer Filters")
 
   protected def fixedPoint =
@@ -111,6 +111,7 @@ abstract class Optimizer(catalogManager: CatalogManager)
         OptimizeJoinCondition,
         LimitPushDown,
         LimitPushDownThroughWindow,
+        RewriteSizeOfArrayStruct,
         ColumnPruning,
         GenerateOptimization,
         // Operator combine
@@ -321,6 +322,9 @@ abstract class Optimizer(catalogManager: CatalogManager)
       // execution, so it must never be excludable.
       ConvertToCatalyst.ruleName,
       FinishAnalysis.ruleName,
+      // ReplaceExpressions (in FinishAnalysis) turns Between/NullIf into the Unevaluable
+      // With expression; excluding this rule leaks it into codegen and fails with INTERNAL_ERROR.
+      RewriteWithExpression.ruleName,
       RewriteDistinctAggregates.ruleName,
       ReplaceDeduplicateWithAggregate.ruleName,
       ReplaceIntersectWithSemiJoin.ruleName,
@@ -1019,6 +1023,10 @@ object LimitPushDown extends Rule[LogicalPlan] {
       LocalLimit(le, udf.copy(child = maybePushLocalLimit(le, udf.child)))
     case LocalLimit(le, p @ Project(_, udf: ArrowEvalPython)) =>
       LocalLimit(le, p.copy(child = udf.copy(child = maybePushLocalLimit(le, udf.child))))
+    case LocalLimit(le, udf: ExecuteExternalUDF) =>
+      LocalLimit(le, udf.copy(child = maybePushLocalLimit(le, udf.child)))
+    case LocalLimit(le, p @ Project(_, udf: ExecuteExternalUDF)) =>
+      LocalLimit(le, p.copy(child = udf.copy(child = maybePushLocalLimit(le, udf.child))))
   }
 }
 
@@ -1707,7 +1715,7 @@ object CollapseRepartition extends Rule[LogicalPlan] {
     // Case 2: When a RepartitionByExpression has a child of global Sort, Repartition or
     // RepartitionByExpression we can remove the child.
     case r @ RepartitionByExpression(
-        _, child @ (Sort(_, true, _, _) | _: RepartitionOperation), _, _) =>
+        _, child @ (Sort(_, true, _, _) | _: RepartitionOperation), _, _, _) =>
       r.withNewChildren(child.children)
     // Case 3: When a RebalancePartitions has a child of local or global Sort, Repartition or
     // RepartitionByExpression we can remove the child.
@@ -1727,7 +1735,7 @@ object CollapseRepartition extends Rule[LogicalPlan] {
 object OptimizeRepartition extends Rule[LogicalPlan] {
   override def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
     _.containsPattern(REPARTITION_OPERATION), ruleId) {
-    case r @ RepartitionByExpression(partitionExpressions, _, numPartitions, _)
+    case r @ RepartitionByExpression(partitionExpressions, _, numPartitions, _, _)
       if partitionExpressions.nonEmpty && partitionExpressions.forall(_.foldable) &&
         numPartitions.isEmpty =>
       r.copy(optNumPartitions = Some(1))
@@ -2449,6 +2457,7 @@ object PushPredicateThroughNonJoin extends Rule[LogicalPlan] with PredicateHelpe
     case _: RebalancePartitions => true
     case _: ScriptTransformation => true
     case _: Sort => true
+    case _: ExecuteExternalUDF => true
     case _: BatchEvalPython => true
     case _: ArrowEvalPython => true
     case _: Expand => true

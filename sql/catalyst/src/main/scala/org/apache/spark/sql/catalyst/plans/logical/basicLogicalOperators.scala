@@ -1322,18 +1322,25 @@ object Aggregate {
     schema.forall(f => UnsafeRow.isMutable(f.dataType))
   }
 
+  /**
+   * Returns whether grouping keys of this type can use raw binary equality or schema-aware key
+   * operations in hash aggregation.
+   */
+  def supportsHashAggregateGroupingKey(dataType: DataType): Boolean = {
+    UnsafeRowKeyOperations.supportsDataType(dataType)
+  }
+
   def supportsHashAggregate(
       aggregateBufferAttributes: Seq[Attribute], groupingExpression: Seq[Expression]): Boolean = {
     val aggregationBufferSchema = DataTypeUtils.fromAttributes(aggregateBufferAttributes)
     isAggregateBufferMutable(aggregationBufferSchema) &&
-      groupingExpression.forall(e => UnsafeRowUtils.isBinaryStable(e.dataType))
+      groupingExpression.forall(e => supportsHashAggregateGroupingKey(e.dataType))
   }
 
   def supportsObjectHashAggregate(
       aggregateExpressions: Seq[AggregateExpression],
       groupingExpressions: Seq[Expression]): Boolean = {
-    // We should not use hash aggregation on binary unstable types.
-    if (groupingExpressions.exists(e => !UnsafeRowUtils.isBinaryStable(e.dataType))) {
+    if (groupingExpressions.exists(e => !supportsHashAggregateGroupingKey(e.dataType))) {
       return false
     }
 
@@ -1869,10 +1876,56 @@ case class BinBy(
   override def producedAttributes: AttributeSet =
     AttributeSet(scaledDistributeColumns ++ appendedAttributes)
 
+  override protected def stringArgs: Iterator[Any] = {
+    BinBy.explainStringArgs(
+      rangeStart = rangeStart,
+      rangeEnd = rangeEnd,
+      binWidthMicros = binWidthMicros,
+      originMicros = originMicros,
+      distributeColumns = distributeColumns,
+      scaledDistributeColumns = scaledDistributeColumns,
+      appendedAttributes = appendedAttributes,
+      timeZoneId = timeZoneId)
+  }
+
   final override val nodePatterns: Seq[TreePattern] = Seq(BIN_BY)
 
   override protected def withNewChildInternal(newChild: LogicalPlan): BinBy =
     copy(child = newChild)
+}
+
+object BinBy {
+
+  // Builds the `stringArgs` for EXPLAIN. LTZ formats `alignTo` in the captured zone and appends
+  // `zone=`, NTZ formats in UTC and omits it.
+  private[sql] def explainStringArgs(
+      rangeStart: Attribute,
+      rangeEnd: Attribute,
+      binWidthMicros: Long,
+      originMicros: Long,
+      distributeColumns: Seq[Attribute],
+      scaledDistributeColumns: Seq[Attribute],
+      appendedAttributes: Seq[Attribute],
+      timeZoneId: Option[String]): Iterator[Any] = {
+    val maxFields = SQLConf.get.maxToStringFields
+    val fmt = TimestampFormatter.getFractionFormatter(
+      DateTimeUtils.getZoneId(timeZoneId.getOrElse("UTC")))
+
+    def refs(attrs: Seq[Attribute]): String = {
+      truncatedString(attrs.map(_.simpleString(maxFields)), "[", ", ", "]", maxFields)
+    }
+
+    Iterator(
+      s"range=[${rangeStart.simpleString(maxFields)}, ${rangeEnd.simpleString(maxFields)}]",
+      "binWidth=" + IntervalUtils.toDayTimeIntervalString(
+        binWidthMicros, IntervalStringStyles.ANSI_STYLE,
+        DayTimeIntervalType.DAY, DayTimeIntervalType.SECOND),
+      s"alignTo=${fmt.format(originMicros)}",
+      s"distribute=${refs(distributeColumns)}",
+      s"scaledDistribute=${refs(scaledDistributeColumns)}",
+      s"appends=${refs(appendedAttributes)}") ++
+      timeZoneId.map(z => s"zone=$z")
+  }
 }
 
 /**
@@ -2215,6 +2268,51 @@ abstract class RepartitionOperation extends UnaryNode {
 }
 
 /**
+ * Generator for unique Repartition IDs within a query, used to correlate the references of a
+ * plan-reuse repartition so they can be materialized once and shared (see
+ * [[PlanReusableRepartition]]).
+ */
+object RepartitionIdGenerator {
+  private val curId = new java.util.concurrent.atomic.AtomicLong(1)
+  def newRepartitionId: Long = curId.getAndIncrement()
+}
+
+/**
+ * A trait for repartition operations that support plan reuse. Repartitions marked for plan reuse
+ * carry a unique id, used to guarantee exchange reuse across references.
+ */
+trait PlanReusableRepartition extends RepartitionOperation {
+  /**
+   * Unique identifier for this repartition node, used for plan reuse.
+   * A value of 0 indicates this repartition is not used for plan reuse.
+   */
+  def repartitionId: Long
+
+  /**
+   * Whether this repartition is used for plan reuse (CTE, decorrelation, etc.).
+   * True when repartitionId is non-zero.
+   */
+  def isForPlanReuse: Boolean = repartitionId != 0L
+
+  /**
+   * Creates a copy of this repartition with a new id.
+   */
+  def withRepartitionId(newId: Long): PlanReusableRepartition
+
+  /**
+   * Assigns a new repartition id (or reassigns if already set).
+   * @param reassign If true, reassigns a new id even if one is already assigned.
+   */
+  def addRepartitionId(reassign: Boolean = false): PlanReusableRepartition = {
+    if (reassign || repartitionId == 0L) {
+      withRepartitionId(RepartitionIdGenerator.newRepartitionId)
+    } else {
+      this
+    }
+  }
+}
+
+/**
  * Returns a new RDD that has exactly `numPartitions` partitions. Differs from
  * [[RepartitionByExpression]] as this method is called directly by DataFrame's, because the user
  * asked for `coalesce` or `repartition`. [[RepartitionByExpression]] is used when the consumer
@@ -2287,8 +2385,9 @@ case class RepartitionByExpression(
     partitionExpressions: Seq[Expression],
     child: LogicalPlan,
     optNumPartitions: Option[Int],
-    optAdvisoryPartitionSize: Option[Long] = None)
-  extends RepartitionOperation with HasPartitionExpressions {
+    optAdvisoryPartitionSize: Option[Long] = None,
+    id: Long = 0)
+  extends RepartitionOperation with HasPartitionExpressions with PlanReusableRepartition {
 
   require(optNumPartitions.isEmpty || optAdvisoryPartitionSize.isEmpty)
 
@@ -2301,6 +2400,16 @@ case class RepartitionByExpression(
   }
 
   override def shuffle: Boolean = true
+
+  // Implement PlanReusableRepartition by delegating to `id`.
+  override def repartitionId: Long = id
+
+  override def withRepartitionId(newId: Long): RepartitionByExpression = this.copy(id = newId)
+
+  // The plan-reuse `id` is an internal correlation field (consumed by
+  // ReplaceRepartitionWithCTEReuse); never render it, so plan output stays deterministic and
+  // stable across runs and unaffected by the new field (EXPLAIN, plan comparisons, golden files).
+  override def stringArgs: Iterator[Any] = super.stringArgs.toArray.dropRight(1).iterator
 
   override protected def withNewChildInternal(newChild: LogicalPlan): RepartitionByExpression =
     copy(child = newChild)
