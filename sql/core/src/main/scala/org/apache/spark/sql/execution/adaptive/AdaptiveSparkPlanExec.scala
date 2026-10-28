@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicReference
 
 import scala.collection.concurrent.TrieMap
 import scala.collection.mutable
-import scala.concurrent.ExecutionContext
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
@@ -49,6 +49,7 @@ import org.apache.spark.sql.execution.columnar.InMemoryTableScanLike
 import org.apache.spark.sql.execution.exchange._
 import org.apache.spark.sql.execution.ui.{SparkListenerSQLAdaptiveExecutionUpdate, SparkListenerSQLAdaptiveSQLMetricUpdates, SQLPlanMetric}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.StaticSQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.{SparkFatalException, ThreadUtils}
 
@@ -119,10 +120,20 @@ case class AdaptiveSparkPlanExec(
         conf.costEvaluatorCountLocalSortEnabled)
     }
 
+  // Read once for this execution so that the union barriers in the lists below, which run per
+  // re-planning round and per stage created, cannot answer from different values. Taken from the
+  // same session conf this query's `QueryExecution.preparations` reads.
+  @transient private val unionConf = UnionConfSnapshot(context.session.sessionState.conf)
+
+  // The same record the listed passes write, for the two places that need it between two rules
+  // rather than as a pass of their own. See `SnapshotUnionPreparationConf`.
+  @transient private val recordUnionConf = new SnapshotUnionPreparationConf(unionConf)
+
   // A list of physical plan rules to be applied before creation of query stages. The physical
   // plan should reach a final status of query stages (i.e., no more addition or removal of
   // Exchange nodes) after running these rules.
-  @transient private val queryStagePreparationRules: Seq[Rule[SparkPlan]] = {
+  // Visible in the package so that a test can assert where the two union barriers below sit.
+  @transient private[adaptive] val queryStagePreparationRules: Seq[Rule[SparkPlan]] = {
     // For cases like `df.repartition(a, b).select(c)`, there is no distribution requirement for
     // the final plan, but we do need to respect the user-specified repartition. Here we ask
     // `EnsureRequirements` to not optimize out the user-specified repartition-by-col to work
@@ -134,7 +145,15 @@ case class AdaptiveSparkPlanExec(
     Seq(
       CoalesceBucketsInJoin,
       RemoveRedundantProjects,
+      // Must run before `ensureRequirements`, which asks a `UnionExec` what it reports: it
+      // records the conf that answer depends on, so the following `StampUnionDecisions` freezes the
+      // decision under the same value the exchanges were planned against.
+      new SnapshotUnionPreparationConf(unionConf),
       ensureRequirements,
+      // Must run after `EnsureRequirements`: it fixes each `UnionExec`'s partitioning decision, so
+      // every rule below and the execution itself read the answer the exchanges above it were
+      // planned against.
+      new StampUnionDecisions(unionConf),
       // This rule must be run after `EnsureRequirements`.
       InsertSortForLimitAndOffset,
       AdjustShuffleExchangePosition,
@@ -158,8 +177,16 @@ case class AdaptiveSparkPlanExec(
       // `RemoveRedundantSorts` runs after `OptimizeSkewedJoin` so that it can also clean up the
       // local sort left dangling right below the extra shuffle that skew join optimization may
       // insert between two joins.
-      RemoveRedundantSorts
-    ) ++ context.session.sessionState.adaptiveRulesHolder.queryStagePrepRules
+      RemoveRedundantSorts,
+      // Flips the final unmaterialized tail's exchanges to pipelined (SPARK-57399 pipelined
+      // channel, opt-in). Runs last so skew handling and sort cleanup have settled
+      // before placement is decided.
+      AQEEnablePipelinedShuffle
+    ) ++ SnapshotUnionPreparationConf.before(
+      unionConf, context.session.sessionState.adaptiveRulesHolder.queryStagePrepRules) :+
+      // A barrier for a `UnionExec` an injected prep rule just created. Decisions already stamped
+      // above are kept.
+      new StampUnionDecisions(unionConf)
   }
 
   // A list of physical optimizer rules to be applied to a new stage before its execution. These
@@ -183,7 +210,12 @@ case class AdaptiveSparkPlanExec(
   // plan to these rules has exchange as its root node.
   private def postStageCreationRules(outputsColumnar: Boolean) = Seq(
     ApplyColumnarRulesAndInsertTransitions(
-      context.session.sessionState.columnarRules, outputsColumnar),
+      SnapshotUnionPreparationConf.after(unionConf, context.session.sessionState.columnarRules),
+      outputsColumnar),
+    // A barrier for a `UnionExec` an injected stage-optimizer or columnar rule just created, which
+    // has no decision yet and would otherwise take one wherever it is first asked. A decision
+    // already stamped on a node is kept, so this pass cannot move one.
+    new StampUnionDecisions(unionConf),
     collapseCodegenStagesRule
   )
 
@@ -196,6 +228,14 @@ case class AdaptiveSparkPlanExec(
     }
     val optimized = rules.foldLeft(plan) { case (latestPlan, rule) =>
       val applied = rule.apply(latestPlan)
+      if (applied ne latestPlan) {
+        // A `UnionExec` this rule just created carries no record of the confs this execution
+        // answers from, and the next rule reads the plan before the barrier in
+        // `postStageCreationRules` stamps it. So does the `ValidateRequirements` check below, for a
+        // rule that is itself an `AQEShuffleReadRule`. A rule that returned its input added
+        // nothing.
+        recordUnionConf(applied)
+      }
       val result = rule match {
         case _: AQEShuffleReadRule if !applied.fastEquals(latestPlan) =>
           val distribution = if (isFinalStage) {
@@ -225,7 +265,11 @@ case class AdaptiveSparkPlanExec(
   private def applyQueryPostPlannerStrategyRules(plan: SparkPlan): SparkPlan = {
     applyPhysicalRules(
       plan,
-      context.session.sessionState.adaptiveRulesHolder.queryPostPlannerStrategyRules,
+      // These rules run before `ensureRequirements`, so one of them can still add or drop an
+      // exchange over a `UnionExec` another just created. A snapshot pass ahead of each is what
+      // keeps that read off the live conf.
+      SnapshotUnionPreparationConf.before(
+        unionConf, context.session.sessionState.adaptiveRulesHolder.queryPostPlannerStrategyRules),
       "AQE Query Post Planner Strategy Rules"
     )
   }
@@ -297,7 +341,48 @@ case class AdaptiveSparkPlanExec(
   /**
    * Run `fun` on finalized physical plan
    */
-  def withFinalPlanUpdate[T](fun: SparkPlan => T): T = lock.synchronized {
+  /**
+   * Drive this AQE to completion of all non-result stages without creating a
+   * [[ResultQueryStageExec]] on top. Used by [[CTEReuseQueryStageExec]] for shared CTE
+   * materialization: all references to a CTE wrap this same inner AQE, whose materialization runs
+   * exactly once via the lazy `materializeFuture`.
+   */
+  def materialize(): Future[Any] = materializeFuture
+
+  /**
+   * Runs [[withFinalPlanUpdate]] (skipping the result stage) on the CTE materialization pool.
+   *
+   * The pool thread does not inherit the initiating query's thread-locals, so
+   * [[SQLExecution.withThreadLocalCaptured]] captures them on the thread that first forces this
+   * lazy val (carrying the execution id, job group, scheduler properties, and artifact state) and
+   * forwards them to the pool thread, mirroring subquery execution (see
+   * [[org.apache.spark.sql.execution.SubqueryExec]]), so the inner CTE jobs stay attributed to the
+   * query and reachable by its cancellation instead of running with an absent or stale context.
+   * The returned `CompletableFuture` is adapted to a Scala `Future`.
+   */
+  @transient private lazy val materializeFuture: Future[Any] = {
+    val javaFuture = SQLExecution.withThreadLocalCaptured(
+        context.session, AdaptiveSparkPlanExec.cteExecutionContext) {
+      withFinalPlanUpdate((_: SparkPlan) => (), skipResultStage = true)
+    }
+    val scalaPromise: Promise[Any] = Promise()
+    javaFuture.whenComplete { (result: Any, exception: Throwable) =>
+      if (exception != null) {
+        scalaPromise.failure(exception match {
+          case completionException: java.util.concurrent.CompletionException =>
+            completionException.getCause
+          case ex => ex
+        })
+      } else {
+        scalaPromise.success(result)
+      }
+    }
+    scalaPromise.future
+  }
+
+  def withFinalPlanUpdate[T](
+      fun: SparkPlan => T,
+      skipResultStage: Boolean = false): T = lock.synchronized {
     _isFinalPlan = false
     // In case of this adaptive plan being executed out of `withActive` scoped functions, e.g.,
     // `plan.queryExecution.rdd`, we need to set active session here as new plan nodes can be
@@ -310,7 +395,7 @@ case class AdaptiveSparkPlanExec(
         // Use inputPlan logicalLink here in case some top level physical nodes may be removed
         // during `initialPlan`
         var currentLogicalPlan = inputPlan.logicalLink.get
-        var result = createQueryStages(fun, currentPhysicalPlan, firstRun = true)
+        var result = createQueryStages(fun, currentPhysicalPlan, firstRun = true, skipResultStage)
         val events = new LinkedBlockingQueue[StageMaterializationEvent]()
         val errors = new mutable.ArrayBuffer[Throwable]()
         val obsoleteCancelledStageIds = new mutable.HashSet[Int]
@@ -425,17 +510,23 @@ case class AdaptiveSparkPlanExec(
             }
           }
           // Now that some stages have finished, we can try creating new stages.
-          result = createQueryStages(fun, currentPhysicalPlan, firstRun = false)
+          result = createQueryStages(fun, currentPhysicalPlan, firstRun = false, skipResultStage)
         }
       }
     }
     _isFinalPlan = true
-    finalPlanUpdate
-    // Dereference the result so it can be GCed. After this resultStage.isMaterialized will return
-    // false, which is expected. If we want to collect result again, we should invoke
-    // `withFinalPlanUpdate` and pass another result handler and we will create a new result stage.
-    currentPhysicalPlan.asInstanceOf[ResultQueryStageExec].resultOption.getAndUpdate(_ => None)
-      .get.asInstanceOf[T]
+    if (skipResultStage) {
+      // Materialize-only path (e.g. from `materialize()`): no ResultQueryStageExec was created.
+      ().asInstanceOf[T]
+    } else {
+      finalPlanUpdate
+      // Dereference the result so it can be GCed. After this resultStage.isMaterialized will return
+      // false, which is expected. If we want to collect result again, we should invoke
+      // `withFinalPlanUpdate` and pass another result handler and we will create a new
+      // result stage.
+      currentPhysicalPlan.asInstanceOf[ResultQueryStageExec].resultOption.getAndUpdate(_ => None)
+        .get.asInstanceOf[T]
+    }
   }
 
   /** Include stages retained by earlier adopted plans as well as newly created query stages. */
@@ -784,7 +875,8 @@ case class AdaptiveSparkPlanExec(
   private def createQueryStages(
       resultHandler: SparkPlan => Any,
       plan: SparkPlan,
-      firstRun: Boolean): CreateStageResult = {
+      firstRun: Boolean,
+      skipResultStage: Boolean = false): CreateStageResult = {
     plan match {
       // 1. ResultQueryStageExec is already created, no need to create non-result stages
       case resultStage @ ResultQueryStageExec(_, optimizedPlan, _) =>
@@ -812,8 +904,8 @@ case class AdaptiveSparkPlanExec(
         var allNewStages = result.newStages
         var newPlan = result.newPlan
         var allChildStagesMaterialized = result.allChildStagesMaterialized
-        // 3. Create result stage
-        if (allNewStages.isEmpty && allChildStagesMaterialized) {
+        // 3. Create result stage (unless the caller only wants non-result stages materialized).
+        if (!skipResultStage && allNewStages.isEmpty && allChildStagesMaterialized) {
           val resultStage = newResultQueryStage(resultHandler, newPlan)
           newPlan = resultStage
           allChildStagesMaterialized = false
@@ -837,6 +929,39 @@ case class AdaptiveSparkPlanExec(
    * 3) A list of the new query stages that have been created.
    */
   private def createNonResultQueryStages(plan: SparkPlan): CreateStageResult = plan match {
+    case re: CTEReuseExchange =>
+      // `PlanCTEReuse` (a preprocessing rule) builds and registers the shared inner AQE for every
+      // cteId before stage creation, so the registry must already hold it -- a miss is a planning
+      // bug. The registry lives on the shared `AdaptiveExecutionContext`, so nested / re-plan paths
+      // that drop `PlanCTEReuse` still find the entry registered by the outer initial run.
+      val innerAQE = context.cteAQERegistry.getOrElse(re.cteId,
+        throw SparkException.internalError(
+          s"No inner AQE registered for CTE cteId=${re.cteId}; PlanCTEReuse must run first."))
+      // Pass this reference's `output` so the stage remaps the shared inner AQE's (primary
+      // reference's) attribute ids into this reference's id space, as aliased references need.
+      val stage = CTEReuseQueryStageExec(currentStageId, innerAQE, re.output)
+      currentStageId += 1
+      setLogicalLinkForNewQueryStage(stage, re)
+      val isMaterialized = stage.isMaterialized
+      CreateStageResult(
+        newPlan = stage,
+        allChildStagesMaterialized = isMaterialized,
+        newStages = if (isMaterialized) Seq.empty else Seq(stage))
+
+    // A pipelined shuffle exchange must NOT be promoted to a query stage: a pipelined
+    // producer cannot materialize on its own (its consumer must be gang-scheduled with it;
+    // the DAGScheduler rejects a map-stage job over a pipelined dependency outright).
+    // Instead it stays inline and executes inside the final result job, whose shape the
+    // scheduler accepts as a fully-materialized regular prefix (the stages created below
+    // here) plus a pipelined suffix group. Recurse through it so child stages still
+    // materialize normally.
+    case s: ShuffleExchangeExec if s.pipelined =>
+      val result = createNonResultQueryStages(s.child)
+      CreateStageResult(
+        newPlan = s.withNewChildren(Seq(result.newPlan)),
+        allChildStagesMaterialized = result.allChildStagesMaterialized,
+        newStages = result.newStages)
+
     case e: Exchange =>
       // First have a quick check in the `stageCache` without having to traverse down the node.
       val reusedStage = if (conf.exchangeReuseEnabled) {
@@ -1145,10 +1270,9 @@ case class AdaptiveSparkPlanExec(
       context.session.sparkContext.listenerBus.post(SparkListenerSQLAdaptiveSQLMetricUpdates(
         executionId, newMetrics))
     } else {
-      val planDescriptionMode = ExplainMode.fromString(conf.uiExplainMode)
       context.session.sparkContext.listenerBus.post(SparkListenerSQLAdaptiveExecutionUpdate(
         executionId,
-        context.qe.explainString(planDescriptionMode),
+        SQLExecution.planDescription(context.qe, conf.uiExplainMode),
         SparkPlanInfo.fromSparkPlan(context.qe.executedPlan)))
     }
   }
@@ -1202,6 +1326,14 @@ object AdaptiveSparkPlanExec {
   private[adaptive] val executionContext = ExecutionContext.fromExecutorService(
     ThreadUtils.newDaemonCachedThreadPool("QueryStageCreator", 16))
 
+  // A separate pool for CTE-reuse inner AQEs. Each inner AQE's `materialize()` blocks a pool
+  // thread waiting on its child stages; sharing the 16-thread `QueryStageCreator` pool would let
+  // deeply nested CTEs exhaust it and deadlock, so CTE inner AQEs get their own pool (sized by
+  // CTE_MATERIALIZATION_MAX_THREAD_THRESHOLD).
+  private[adaptive] val cteExecutionContext = ExecutionContext.fromExecutorService(
+    ThreadUtils.newDaemonCachedThreadPool("CTEReuseInnerAQE",
+      SQLConf.get.getConf(StaticSQLConf.CTE_MATERIALIZATION_MAX_THREAD_THRESHOLD)))
+
   /**
    * The temporary [[LogicalPlan]] link for query stages.
    *
@@ -1240,6 +1372,14 @@ case class AdaptiveExecutionContext(session: SparkSession, qe: QueryExecution) {
    */
   val stageCache: TrieMap[SparkPlan, ExchangeQueryStageExec] =
     new TrieMap[SparkPlan, ExchangeQueryStageExec]()
+
+  /**
+   * Registry of the shared inner [[AdaptiveSparkPlanExec]] for each reused CTE, keyed by `cteId`.
+   * Populated by `PlanCTEReuse` (AQE on): all references to one CTE wrap the same inner AQE so the
+   * CTE body is materialized once and shared. Shared across the main query and its sub-queries.
+   */
+  val cteAQERegistry: TrieMap[Long, AdaptiveSparkPlanExec] =
+    new TrieMap[Long, AdaptiveSparkPlanExec]()
 
   private val stageLifecycleLock = new Object
 

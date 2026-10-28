@@ -33,13 +33,13 @@ import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans.logical.Aggregate
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
+import org.apache.spark.sql.catalyst.util.{truncatedString, UnsafeRowUtils}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
-import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.vectorized.MutableColumnarRow
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{CalendarIntervalType, DecimalType, StringType}
+import org.apache.spark.sql.types.{CalendarIntervalType, DecimalType, StringType, UserDefinedType}
 import org.apache.spark.unsafe.KVIterator
 import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
@@ -60,6 +60,8 @@ case class HashAggregateExec(
   extends AggregateCodegenSupport {
 
   require(Aggregate.supportsHashAggregate(aggregateBufferAttributes, groupingExpressions))
+  require(!isStreaming ||
+    groupingExpressions.forall(e => UnsafeRowUtils.isBinaryStable(e.dataType)))
 
   override def allAttributes: AttributeSeq =
     child.output ++ aggregateBufferAttributes ++ aggregateAttributes ++
@@ -263,6 +265,15 @@ case class HashAggregateExec(
   // passed-through rows a child emits before it honours `shouldStop()` (see
   // `handlePassThroughRow`).
   private var adaptivePendingRowsTerm: String = _
+  // The initial aggregation buffer, and the reusable buffer each passed-through row starts from.
+  // The reusable buffer is reset with `copyFrom`, as on the interpreted path, so the per-row reset
+  // is a single call however many buffer slots there are. Both are created once per task and
+  // registered in `doProduceWithKeys`, which runs once, rather than in `doConsumeWithKeys`, which
+  // runs once per child of a fused `UnionExec`. Reusing one buffer is safe because a
+  // passed-through row is copied before it is queued, and `outputFunc` reads the buffer before it
+  // returns.
+  private var adaptiveEmptyBufferTerm: String = _
+  private var adaptivePassThroughBufferTerm: String = _
 
   /**
    * This is called by generated Java class, should be public.
@@ -373,7 +384,7 @@ case class HashAggregateExec(
           var findNextGroup = false
           while (!findNextGroup && sortedIter.next()) {
             val key = sortedIter.getKey
-            if (currentKey.equals(key)) {
+            if (hashMap.keysEqual(currentKey, key)) {
               mergeProjection(joinedRow(currentRow, sortedIter.getValue))
             } else {
               // We find a new group.
@@ -504,6 +515,8 @@ case class HashAggregateExec(
    */
   private def checkIfFastHashMapSupported(): Boolean = {
     val isSupported =
+      groupingExpressions.forall(e => UnsafeRowUtils.isBinaryStable(e.dataType)) &&
+      groupingKeySchema.forall(!_.dataType.isInstanceOf[UserDefinedType[_]]) &&
       (groupingKeySchema ++ bufferSchema).forall(f => CodeGenerator.isPrimitiveType(f.dataType) ||
         f.dataType.isInstanceOf[DecimalType] || f.dataType.isInstanceOf[StringType] ||
         f.dataType.isInstanceOf[CalendarIntervalType])
@@ -584,6 +597,14 @@ case class HashAggregateExec(
     }
 
     val thisPlan = ctx.addReferenceObj("plan", this)
+
+    if (adaptivePartialAggEnabled) {
+      adaptiveEmptyBufferTerm = ctx.addMutableState("UnsafeRow", "adaptiveEmptyBuffer",
+        v => s"$v = (UnsafeRow) $thisPlan.getEmptyAggregationBuffer();", forceInline = true)
+      adaptivePassThroughBufferTerm = ctx.addMutableState("UnsafeRow",
+        "adaptivePassThroughBuffer", v => s"$v = $adaptiveEmptyBufferTerm.copy();",
+        forceInline = true)
+    }
 
     // Create a name for the iterator from the fast hash map, and the code to create fast hash map.
     val (iterTermForFastHashMap, createFastHashMap) = if (isFastHashMapEnabled) {
@@ -908,19 +929,9 @@ case class HashAggregateExec(
     val fastRowKeys = ctx.generateExpressions(
       bindReferences[Expression](groupingExpressions, child.output))
     val unsafeRowKeys = unsafeRowKeyCode.value
-    val unsafeRowKeyHash = ctx.freshName("unsafeRowKeyHash")
     val unsafeRowBuffer = ctx.freshName("unsafeRowAggBuffer")
     val fastRowBuffer = ctx.freshName("fastAggBuffer")
 
-    // For adaptive partial aggregation pass-through, each bypassed row is emitted as a single-row
-    // partial buffer: start from the initial aggregation buffer, apply the update expressions once,
-    // and output `key ++ buffer` for the Final aggregate to merge. This projects the initial
-    // buffer.
-    val emptyAggBufferCode = if (adaptivePartialAggEnabled) {
-      GenerateUnsafeProjection.createCode(ctx, declFunctions.flatMap(f => f.initialValues))
-    } else {
-      null
-    }
     // Per-row local flag marking that the current row is being streamed through (held by no map).
     val adaptiveRowBypassedTerm = ctx.freshName("adaptiveRowBypassed")
 
@@ -946,9 +957,11 @@ case class HashAggregateExec(
     // The compaction ratio is measured at the operator level: all processed rows against the keys
     // held by both maps, so two-level-map routing does not change the decision. The same predicate
     // decides both check points -- periodically every `minRows` rows, and right before the map
-    // would spill (in which case the spill is skipped entirely). `minRows = 0` disables the
-    // periodic check: the row count is only ever compared after being incremented past 0, so it
-    // never matches and only the spill check remains.
+    // would spill (in which case the spill is skipped entirely). Pass-through cannot be undone
+    // within the task, so the spill check, like the periodic one, waits until the current epoch
+    // has processed `minRows` rows; a map that fills sooner spills as usual. `minRows = 0`
+    // disables the periodic check: the row count is only ever compared after being incremented
+    // past 0, so it never matches and only the spill check remains, without a row floor.
     val adaptiveIneffective = if (adaptivePartialAggEnabled) {
       val totalKeys = if (isFastHashMapEnabled) {
         s"($fastHashMapTerm.getNumKeys() - $adaptiveFastKeysAtSpillTerm + " +
@@ -967,13 +980,21 @@ case class HashAggregateExec(
       // per regular-map row (see below); emitting it in more than one runtime branch is unsafe
       // because the projection's subexpression/writer state assigned in one branch would be read
       // stale from another (e.g. the adaptive pass-through path would reuse the last probed key).
+      val (computeKeyHash, lookupBuffer) =
+        if (UnsafeRowUtils.isBinaryStable(groupingKeySchema)) {
+          val unsafeRowKeyHash = ctx.freshName("unsafeRowKeyHash")
+          (s"int $unsafeRowKeyHash = ${unsafeRowKeyCode.value}.hashCode();",
+            s"$hashMapTerm.getAggregationBufferFromUnsafeRow(" +
+              s"$unsafeRowKeys, $unsafeRowKeyHash)")
+        } else {
+          ("", s"$hashMapTerm.getAggregationBufferFromUnsafeRow($unsafeRowKeys)")
+        }
       val probeRegularMap =
         s"""
-           |int $unsafeRowKeyHash = ${unsafeRowKeyCode.value}.hashCode();
+           |$computeKeyHash
            |if ($checkFallbackForBytesToBytesMap) {
            |  // try to get the buffer from hash map
-           |  $unsafeRowBuffer =
-           |    $hashMapTerm.getAggregationBufferFromUnsafeRow($unsafeRowKeys, $unsafeRowKeyHash);
+           |  $unsafeRowBuffer = $lookupBuffer;
            |}
          """.stripMargin
 
@@ -984,8 +1005,7 @@ case class HashAggregateExec(
            |$resetCounter
            |// the hash map had been spilled, so it should have enough memory now,
            |// try to allocate buffer again.
-           |$unsafeRowBuffer = $hashMapTerm.getAggregationBufferFromUnsafeRow(
-           |  $unsafeRowKeys, $unsafeRowKeyHash);
+           |$unsafeRowBuffer = $lookupBuffer;
            |if ($unsafeRowBuffer == null) {
            |  // failed to allocate the first page
            |  throw QueryExecutionErrors.aggregateOutOfMemoryError();
@@ -1010,13 +1030,15 @@ case class HashAggregateExec(
              |$adaptiveNextCheckRowTerm = ${adaptiveMinRows}L;
              |$snapshotFastKeys
            """.stripMargin
+        // The spill check needs at least one processed row even when `minRows = 0`.
+        val spillCheckMinRows = math.max(adaptiveMinRows, 1L)
         s"""
            |// generate grouping key
            |${unsafeRowKeyCode.code}
            |if (!$adaptivePassThroughTerm) {
            |  $probeRegularMap
            |  if ($unsafeRowBuffer == null) {
-           |    if ($processedRowsTerm > 0 && $adaptiveIneffective) {
+           |    if ($processedRowsTerm >= ${spillCheckMinRows}L && $adaptiveIneffective) {
            |      $adaptivePassThroughTerm = true;
            |    } else {
            |      $spillAndRestartEpoch
@@ -1092,7 +1114,9 @@ case class HashAggregateExec(
         }
         // The grouping key was already projected in `findOrInsertRegularHashMap`
         // (`unsafeRowKeyCode.code`), so `unsafeRowKeyCode.value` holds this row's key. Only build
-        // the single-row partial buffer here.
+        // the single-row partial buffer here: reset the reusable buffer to the initial aggregation
+        // buffer, so the update expressions below apply this row alone and `key ++ buffer` is
+        // emitted for the Final aggregate to merge.
         s"""
            |if ($heldByAMap) {
            |  if (!$adaptivePassThroughTerm) {
@@ -1107,8 +1131,8 @@ case class HashAggregateExec(
            |  }
            |} else if ($adaptivePassThroughTerm) {
            |  $adaptiveRowBypassedTerm = true;
-           |  ${emptyAggBufferCode.code}
-           |  $unsafeRowBuffer = ${emptyAggBufferCode.value};
+           |  $adaptivePassThroughBufferTerm.copyFrom($adaptiveEmptyBufferTerm);
+           |  $unsafeRowBuffer = $adaptivePassThroughBufferTerm;
            |}
          """.stripMargin
       } else {
