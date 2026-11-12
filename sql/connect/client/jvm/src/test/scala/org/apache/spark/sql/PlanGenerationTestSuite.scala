@@ -106,6 +106,8 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
 
   private val printer = JsonFormat.printer().usingTypeRegistry(registry)
 
+  private val testUDT = new TestUDT.NewArrayUDT()
+
   private var session: SparkSession = _
 
   override protected def beforeAll(): Unit = {
@@ -606,6 +608,39 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
 
   test("between expr") {
     simple.selectExpr("rand(123) BETWEEN 0.1 AND 0.2")
+  }
+
+  test("binBy") {
+    val input = session
+      .range(1)
+      .selectExpr(
+        "TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start",
+        "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end",
+        "100.0D AS value")
+    input.binBy(
+      rangeStart = input("start"),
+      rangeEnd = input("end"),
+      binWidth = fn.expr("INTERVAL 5 MINUTES"),
+      distributeUniform = Array(input("value")))
+  }
+
+  test("binBy all_options") {
+    val input = session
+      .range(1)
+      .selectExpr(
+        "TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start",
+        "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end",
+        "100.0D AS value",
+        "20.0F AS value2")
+    input.binBy(
+      rangeStart = input("start"),
+      rangeEnd = input("end"),
+      binWidth = fn.expr("INTERVAL 5 MINUTES"),
+      distributeUniform = Array(input("value"), input("value2")),
+      alignTo = fn.expr("TIMESTAMP_NTZ '2024-01-01 00:02:00'"),
+      binStartName = "window_start",
+      binEndName = "window_end",
+      binDistributeRatioName = "ratio")
   }
 
   test("unpivot values") {
@@ -2843,6 +2878,10 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
     fn.variant_strip_nulls(fn.parse_json(fn.col("g")), false)
   }
 
+  functionTest("variant_pick") {
+    fn.variant_pick(fn.parse_json(fn.col("g")), "$.a", "$.b")
+  }
+
   functionTest("variant_get") {
     fn.variant_get(fn.parse_json(fn.col("g")), "$", "int")
   }
@@ -3298,6 +3337,14 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
 
   functionTest("typeof") {
     fn.typeof(fn.col("g"))
+  }
+
+  functionTest("wrap_udt") {
+    fn.wrap_udt(fn.array(fn.col("b")), testUDT)
+  }
+
+  functionTest("unwrap_udt") {
+    fn.unwrap_udt(fn.wrap_udt(fn.array(fn.col("b")), testUDT))
   }
 
   functionTest("stack") {

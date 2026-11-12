@@ -15,11 +15,10 @@
 # limitations under the License.
 #
 
-from functools import total_ordering
 import itertools
 import os
 import re
-import sys
+from functools import total_ordering
 from pathlib import Path, PurePath
 
 all_modules = []
@@ -59,6 +58,8 @@ ignored_file_patterns = (
     "/dev/requirements.txt",
     "/dev/spark_merge_footer.py",
     "/dev/spark-test-image/lint/Dockerfile",
+    # Always run by the precondition job in build_and_test.yml.
+    "/dev/sparktestsupport/tests/",
     "/dev/structured_logging_style.py",
     "/ui-test/package-lock.json",
     "/ui-test/package.json",
@@ -83,10 +84,6 @@ def is_ignored_file(filename: str) -> bool:
     A trailing slash ignores a directory subtree:
     >>> is_ignored_file("dev/create-release/spark-rm/Dockerfile")
     True
-
-    Non-matches fall through:
-    >>> is_ignored_file("xasfZyaml")
-    False
     """
     path = PurePath("/") / filename
     for pattern in ignored_file_patterns:
@@ -129,6 +126,7 @@ class Module(object):
         Define a new module.
 
         :param name: A short module name, for display in logging and error messages.
+            Must be unique across modules.
         :param dependencies: A set of dependencies for this module. This should only include direct
             dependencies; transitive dependencies are resolved automatically.
         :param source_file_regexes: a set of regexes that match source files belonging to this
@@ -148,6 +146,9 @@ class Module(object):
         :param should_run_r_tests: If true, changes in this module will trigger all R tests.
         :param should_run_build_tests: If true, changes in this module will trigger build tests.
         """
+        if any(module.name == name for module in all_modules):
+            raise ValueError(f"module name {name!r} is already in use")
+
         self.name = name
         self.dependencies = dependencies
         self.source_file_prefixes = source_file_regexes
@@ -176,7 +177,9 @@ class Module(object):
         """
         path = Path(filename)
         last_part = path.parts[-1]
-        if not re.match(r"test_.*\.py", last_part):
+        # Anchored: only Python modules are test files, not the files that merely
+        # start with a module name (e.g. a `test_x.py.out` golden file).
+        if not re.match(r"test_.*\.py$", last_part):
             return False
         module_path = ".".join(path.parts)[:-3]  # Remove the ".py" suffix
         return not any(module_path.endswith(test) for test in self.python_test_goals)
@@ -205,6 +208,17 @@ tags = Module(
     ],
 )
 
+config = Module(
+    name="config",
+    dependencies=[tags],
+    source_file_regexes=[
+        "common/config/",
+    ],
+    sbt_test_goals=[
+        "config/test",
+    ],
+)
+
 utils_java = Module(
     name="utils-java",
     dependencies=[tags],
@@ -218,7 +232,7 @@ utils_java = Module(
 
 utils = Module(
     name="utils",
-    dependencies=[tags, utils_java],
+    dependencies=[tags, utils_java, config],
     source_file_regexes=[
         "common/utils/",
     ],
@@ -349,7 +363,7 @@ catalyst = Module(
 
 sql = Module(
     name="sql",
-    dependencies=[catalyst],
+    dependencies=[catalyst, udf_worker],
     source_file_regexes=[
         "sql/core/",
         "python/pyspark/sql/worker/",  # analyze_udtf is invoked and tested in JVM
@@ -493,6 +507,7 @@ credential_aws = Module(
     dependencies=[tags, core],
     source_file_regexes=[
         "connector/credential-aws/",
+        "connector/credential-aws-integration-tests/",
     ],
     build_profile_flags=[
         "-Pcredential-aws",
@@ -573,10 +588,22 @@ examples = Module(
     ],
 )
 
+# Shared Python test environment.
+pyspark_base = Module(
+    name="pyspark-base",
+    dependencies=[],
+    source_file_regexes=[
+        "dev/spark-test-image/python-.*/",
+        "pyproject.toml",
+    ],
+)
+
 pyspark_core = Module(
     name="pyspark-core",
-    dependencies=[core],
-    source_file_regexes=["python/(?!pyspark/(ml|mllib|sql|streaming|pandas|resource|testing))"],
+    dependencies=[core, pyspark_base],
+    source_file_regexes=[
+        "python/(?!pyspark/(ml|mllib|sql|streaming|pandas|resource|testing|inprocess))"
+    ],
     python_test_goals=[
         # doctests
         "pyspark.conf",
@@ -613,27 +640,13 @@ pyspark_core = Module(
         "pyspark.tests.test_worker",
         "pyspark.tests.test_stage_sched",
         "pyspark.tests.test_zero_copy_byte_stream",
-        # unittests for upstream projects
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_array_cast",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_array_from_pandas_default",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_array_from_pandas_non_default",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_array_type_inference",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_arrow_to_pandas_default",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_arrow_to_pandas_non_default",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_dataframe_from_pandas",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_ignore_timezone",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_scalar_type_coercion",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_scalar_type_inference",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_table_cast",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_table_to_pandas",
-        "pyspark.tests.upstream.pyarrow.test_pyarrow_type_coercion",
     ],
 )
 
 pyspark_sql = Module(
     name="pyspark-sql",
     dependencies=[pyspark_core, hive, avro, protobuf],
-    source_file_regexes=["python/pyspark/sql"],
+    source_file_regexes=["python/pyspark/sql", "python/pyspark/inprocess"],
     python_test_goals=[
         # doctests
         "pyspark.sql.types",
@@ -665,6 +678,13 @@ pyspark_sql = Module(
         "pyspark.sql.observation",
         "pyspark.sql.tvf",
         # unittests
+        "pyspark.eval_handlers.tests.test_arrow_eval_type_handlers",
+        "pyspark.eval_handlers.tests.test_base_eval_type_handlers",
+        "pyspark.eval_handlers.tests.test_elementwise_eval_type_handlers",
+        "pyspark.eval_handlers.tests.test_pandas_eval_type_handlers",
+        "pyspark.eval_handlers.tests.test_stateful_eval_type_handlers",
+        "pyspark.eval_handlers.tests.test_udtf_eval_type_handlers",
+        "pyspark.eval_handlers.tests.test_vanilla_eval_type_handlers",
         "pyspark.sql.tests.test_artifact",
         "pyspark.sql.tests.test_catalog",
         "pyspark.sql.tests.test_column",
@@ -672,8 +692,9 @@ pyspark_sql = Module(
         "pyspark.sql.tests.test_context",
         "pyspark.sql.tests.test_sql_context",
         "pyspark.sql.tests.test_dataframe",
+        "pyspark.sql.tests.test_pipelined_shuffle",
         "pyspark.sql.tests.test_collection",
-        "pyspark.sql.tests.test_creation",
+        "pyspark.sql.tests.test_dataframe_creation",
         "pyspark.sql.tests.test_conversion",
         "pyspark.sql.tests.test_dataframe_query_context",
         "pyspark.sql.tests.test_listener",
@@ -686,6 +707,8 @@ pyspark_sql = Module(
         "pyspark.sql.tests.test_group",
         "pyspark.sql.tests.test_sql",
         "pyspark.sql.tests.test_job_cancellation",
+        "pyspark.sql.tests.test_inprocess_udf",
+        "pyspark.sql.tests.test_inprocess_runtime",
         "pyspark.sql.tests.arrow.test_arrow",
         "pyspark.sql.tests.arrow.test_arrow_map",
         "pyspark.sql.tests.arrow.test_arrow_cogrouped_map",
@@ -723,6 +746,7 @@ pyspark_sql = Module(
         "pyspark.sql.tests.test_types",
         "pyspark.sql.tests.test_geographytype",
         "pyspark.sql.tests.test_geometrytype",
+        "pyspark.sql.tests.test_python_worker_env",
         "pyspark.sql.tests.test_udf",
         "pyspark.sql.tests.test_udf_combinations",
         "pyspark.sql.tests.test_udf_in_higher_order_function",
@@ -742,7 +766,7 @@ pyspark_sql = Module(
         "pyspark.sql.tests.coercion.test_python_udf_input_type",
         "pyspark.sql.tests.coercion.test_pandas_udf_return_type",
         "pyspark.sql.tests.coercion.test_python_udf_return_type",
-        "pyspark.sql.tests.df_golden.test_df_golden",
+        "pyspark.sql.tests.df_golden.inputs.test_group_by",
         "pyspark.sql.tests.df_golden.test_df_golden_framework",
     ],
 )
@@ -924,20 +948,35 @@ pyspark_ml = Module(
     ],
 )
 
-pyspark_install = Module(
-    name="pyspark-install",
-    dependencies=[],
+pyspark_periodic = Module(
+    name="pyspark-periodic",
+    dependencies=[pyspark_base],
     source_file_regexes=[
-        # Python package tests will be triggered with this module
+        # This module contains tests that are not sensitive to pyspark code changes.
+        # We run these on scheduled CIs and pre-merge CIs, not post-merge CIs.
         # Any changes in python/ should trigger this module
-        # This module won't be executed for post-commit CIs so it's cheap
         "python/",
-        "python/pyspark/install.py",
-        "python/pyspark/tests/test_install_spark.py",
     ],
     python_test_goals=[
         "pyspark.tests.test_import_spark",
         "pyspark.tests.test_install_spark",
+        # unittests for upstream projects
+        "pyspark.tests.upstream.numpy.test_numpy_ufunc_type_coercion",
+        "pyspark.tests.upstream.pandas.test_pandas_api_types",
+        "pyspark.tests.upstream.pandas.test_pandas_series_astype",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_array_cast",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_array_from_pandas_default",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_array_from_pandas_non_default",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_array_type_inference",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_arrow_to_pandas_default",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_arrow_to_pandas_non_default",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_dataframe_from_pandas",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_ignore_timezone",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_scalar_type_coercion",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_scalar_type_inference",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_table_cast",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_table_to_pandas",
+        "pyspark.tests.upstream.pyarrow.test_pyarrow_type_coercion",
     ],
 )
 
@@ -1248,6 +1287,7 @@ pyspark_connect = Module(
     dependencies=[pyspark_sql, connect],
     source_file_regexes=[
         "python/pyspark/sql/connect",
+        "sbin/start-connect-server.sh",
     ],
     python_test_goals=[
         # sql doctests
@@ -1274,11 +1314,12 @@ pyspark_connect = Module(
         "pyspark.sql.tests.connect.test_connect_dataframe_property",
         "pyspark.sql.tests.connect.test_connect_channel",
         "pyspark.sql.tests.connect.test_connect_clone_session",
+        "pyspark.sql.tests.connect.test_parity_python_worker_env",
         "pyspark.sql.tests.connect.test_connect_error",
         "pyspark.sql.tests.connect.test_connect_function",
         "pyspark.sql.tests.connect.test_connect_collection",
         "pyspark.sql.tests.connect.test_connect_column",
-        "pyspark.sql.tests.connect.test_connect_creation",
+        "pyspark.sql.tests.connect.test_connect_dataframe_creation",
         "pyspark.sql.tests.connect.test_connect_readwriter",
         "pyspark.sql.tests.connect.test_connect_retry",
         "pyspark.sql.tests.connect.test_connect_session",
@@ -1301,7 +1342,7 @@ pyspark_connect = Module(
         "pyspark.sql.tests.connect.test_parity_dataframe",
         "pyspark.sql.tests.connect.test_parity_dataframe_query_context",
         "pyspark.sql.tests.connect.test_parity_collection",
-        "pyspark.sql.tests.connect.test_parity_creation",
+        "pyspark.sql.tests.connect.test_parity_dataframe_creation",
         "pyspark.sql.tests.connect.test_parity_observation",
         "pyspark.sql.tests.connect.test_parity_repartition",
         "pyspark.sql.tests.connect.test_parity_stat",
@@ -1364,6 +1405,7 @@ pyspark_structured_streaming_connect = Module(
     python_test_goals=[
         # unittests
         "pyspark.sql.tests.connect.test_parity_python_streaming_datasource",
+        "pyspark.sql.tests.connect.streaming.test_listener",
         "pyspark.sql.tests.connect.streaming.test_parity_streaming",
         "pyspark.sql.tests.connect.streaming.test_parity_listener",
         "pyspark.sql.tests.connect.streaming.test_parity_foreach",
@@ -1706,7 +1748,7 @@ pyspark_errors = Module(
 
 pyspark_logger = Module(
     name="pyspark-logger",
-    dependencies=[],
+    dependencies=[pyspark_base],
     source_file_regexes=["python/pyspark/logger"],
     python_test_goals=[
         # doctests
@@ -1834,13 +1876,22 @@ root = Module(
 )
 
 
-def _test():
-    import doctest
+def transitive_dependencies(module: Module) -> set[Module]:
+    """
+    Return all modules that `module` depends on, directly or transitively.
+    The module itself is not included.
 
-    failure_count = doctest.testmod()[0]
-    if failure_count:
-        sys.exit(-1)
+    `utils-java` is an indirect dependency of `unsafe`:
 
-
-if __name__ == "__main__":
-    _test()
+    >>> sorted(dependency.name for dependency in transitive_dependencies(unsafe))
+    ['config', 'tags', 'utils', 'utils-java']
+    """
+    seen = set()
+    pending = list(module.dependencies)
+    while pending:
+        dependency = pending.pop()
+        if dependency in seen or dependency is module:
+            continue
+        seen.add(dependency)
+        pending.extend(dependency.dependencies)
+    return seen

@@ -29,12 +29,7 @@ object TreePattern extends Enumeration  {
   val ALIAS: Value = Value
   val ANALYSIS_AWARE_EXPRESSION: Value = Value
   val AND: Value = Value
-  val ARRAYS_OVERLAP: Value = Value
   val ARRAYS_ZIP: Value = Value
-  val ARRAY_DISTINCT: Value = Value
-  val ARRAY_EXCEPT: Value = Value
-  val ARRAY_INTERSECT: Value = Value
-  val ARRAY_UNION: Value = Value
   val ATTRIBUTE_REFERENCE: Value = Value
   val AVERAGE: Value = Value
   val BINARY_ARITHMETIC: Value = Value
@@ -89,11 +84,13 @@ object TreePattern extends Enumeration  {
   val OR: Value = Value
   val OUTER_REFERENCE: Value = Value
   val PARAMETER: Value = Value
+  val PARSE_SQL: Value = Value
   val PIPE_EXPRESSION: Value = Value
   val PLAN_EXPRESSION: Value = Value
   val PYTHON_UDF: Value = Value
   val REGEXP_EXTRACT_FAMILY: Value = Value
   val REGEXP_REPLACE: Value = Value
+  val RESOLVED_STAR: Value = Value
   val RUNTIME_REPLACEABLE: Value = Value
   val SEMI_STRUCTURED_EXTRACT: Value = Value
   val SCALAR_SUBQUERY: Value = Value
@@ -102,11 +99,13 @@ object TreePattern extends Enumeration  {
   val SESSION_WINDOW: Value = Value
   val SQL_FUNCTION_EXPRESSION: Value = Value
   val SQL_SCALAR_FUNCTION: Value = Value
+  val SUBTRACT_TIMESTAMPS: Value = Value
   val SUM: Value = Value
   val TEMP_RESOLVED_COLUMN: Value = Value
   val TIME_WINDOW: Value = Value
   val TIME_ZONE_AWARE_EXPRESSION: Value = Value
   val TRANSPILED_PYTHON_UDF: Value = Value
+  val TRANSPILED_UDF_PARAMETER: Value = Value
   val TRUE_OR_FALSE_LITERAL: Value = Value
   val USER_DEFINED_AGGREGATION: Value = Value
   val VARIANT_GET: Value = Value
@@ -129,8 +128,14 @@ object TreePattern extends Enumeration  {
   val UNRESOLVED_DF_STAR: Value = Value
   val UNRESOLVED_FUNCTION: Value = Value
   val UNRESOLVED_IDENTIFIER: Value = Value
+  val UNRESOLVED_JSON_CONSTRUCTOR: Value = Value
   val UNRESOLVED_ORDINAL: Value = Value
   val UNRESOLVED_PLAN_ID: Value = Value
+  val UNRESOLVED_REGEX: Value = Value
+  val UNRESOLVED_STAR: Value = Value
+  val UNRESOLVED_STAR_EXCEPT_OR_REPLACE: Value = Value
+  val UNRESOLVED_STAR_WITH_COLUMNS: Value = Value
+  val UNRESOLVED_STAR_WITH_COLUMNS_RENAMES: Value = Value
   val UNRESOLVED_WINDOW_EXPRESSION: Value = Value
 
   // Execution expression patterns (alphabetically ordered)
@@ -146,6 +151,7 @@ object TreePattern extends Enumeration  {
   val COLLECT_METRICS: Value = Value
   val COMMAND: Value = Value
   val CTE: Value = Value
+  val CTE_REUSE: Value = Value
   val DATA_SOURCE_V2_RELATION: Value = Value
   val DATA_SOURCE_V2_SCAN_RELATION: Value = Value
   val DELETE_FROM_TABLE: Value = Value
@@ -157,6 +163,7 @@ object TreePattern extends Enumeration  {
   val EVENT_TIME_WATERMARK: Value = Value
   val EXCEPT: Value = Value
   val EXECUTE_IMMEDIATE: Value = Value
+  val EXTERNAL_LOOKUP_JOIN: Value = Value
   val INTERSECT: Value = Value
   val FILTER: Value = Value
   val GENERATE: Value = Value
@@ -168,6 +175,7 @@ object TreePattern extends Enumeration  {
   val LIMIT: Value = Value
   val LOCAL_RELATION: Value = Value
   val LOGICAL_QUERY_STAGE: Value = Value
+  val LOOKUP_ONLY_RELATION: Value = Value
   val MERGE_INTO_TABLE: Value = Value
   val METRIC_VIEW_PLACEHOLDER: Value = Value
   val NATURAL_LIKE_JOIN: Value = Value
@@ -212,6 +220,7 @@ object TreePattern extends Enumeration  {
   val UNRESOLVED_EVENT_TIME_WATERMARK: Value = Value
   val UNRESOLVED_HAVING: Value = Value
   val UNRESOLVED_HINT: Value = Value
+  val UNRESOLVED_INSERT: Value = Value
   val UNRESOLVED_QUALIFY: Value = Value
   val UNRESOLVED_FUNC: Value = Value
   val UNRESOLVED_PROCEDURE: Value = Value
@@ -223,5 +232,6 @@ object TreePattern extends Enumeration  {
   val UNRESOLVED_WITH: Value = Value
 
   // Execution Plan patterns (alphabetically ordered)
+  val CTE_REUSE_EXCHANGE: Value = Value
   val EXCHANGE: Value = Value
 }
