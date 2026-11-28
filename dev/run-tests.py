@@ -18,23 +18,25 @@
 #
 
 import itertools
-from argparse import ArgumentParser
 import os
 import re
-import sys
 import subprocess
+import sys
 import tempfile
+from argparse import ArgumentParser
+from collections.abc import Sequence
 from contextlib import contextmanager
 
+import sparktestsupport.modules as modules
 from sparktestsupport import SPARK_HOME, USER_HOME
-from sparktestsupport.shellutils import exit_from_command_with_retcode, run_cmd, rm_r, which
+from sparktestsupport.shellutils import exit_from_command_with_retcode, rm_r, run_cmd, which
 from sparktestsupport.utils import (
     determine_dangling_python_tests,
     determine_modules_for_files,
     determine_modules_to_test,
+    determine_shell_script_test_goals,
     identify_changed_files_from_git_commits,
 )
-import sparktestsupport.modules as modules
 
 
 def setup_test_environ(environ):
@@ -380,8 +382,16 @@ def run_python_packaging_tests():
     run_cmd(command)
 
 
-def run_build_tests():
-    run_cmd([os.path.join(SPARK_HOME, "dev", "test-dependencies.sh")])
+def run_shell_script_tests(
+    test_modules: Sequence[modules.Module], stage: modules.TestStage
+) -> None:
+    """Run the selected shell script goals for the given stage."""
+    shell_script_test_goals = determine_shell_script_test_goals(test_modules, stage)
+
+    for test_goal in shell_script_test_goals:
+        with titled_block(f"Running {test_goal.path}"):
+            command = [os.path.join(SPARK_HOME, test_goal.path)]
+            run_cmd(command)
 
 
 def run_sparkr_tests():
@@ -602,9 +612,10 @@ def main():
             with titled_block("Running R style checks"):
                 run_sparkr_style_checks()
 
-    if any(m.should_run_build_tests for m in test_modules):
-        with titled_block("Running build tests"):
-            run_build_tests()
+    run_shell_script_tests(
+        test_modules,
+        modules.TestStage.PRE_BUILD,
+    )
 
     # spark build
     if os.environ.get("SKIP_SCALA_BUILD", "false") != "true":
@@ -664,17 +675,10 @@ def main():
 
 
 def _test():
-    import doctest
-    import sparktestsupport.modules
-    import sparktestsupport.utils
+    import unittest
 
-    test_results = (
-        doctest.testmod(sparktestsupport.modules),
-        doctest.testmod(sparktestsupport.utils),
-        doctest.testmod(),
-    )
-    failure_count = sum([num_failures for (num_failures, num_tests) in test_results])
-    if failure_count:
+    tests = unittest.defaultTestLoader.discover("sparktestsupport.tests")
+    if not unittest.TextTestRunner().run(tests).wasSuccessful():
         sys.exit(-1)
 
 

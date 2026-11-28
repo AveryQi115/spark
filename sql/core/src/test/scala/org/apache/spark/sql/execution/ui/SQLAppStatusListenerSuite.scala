@@ -58,7 +58,7 @@ import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.status.{AppStatusStore, ElementTrackingStore}
-import org.apache.spark.util.{AccumulatorMetadata, JsonProtocol, LongAccumulator, MetricUtils, SerializableConfiguration, Utils}
+import org.apache.spark.util.{AccumulatorContext, AccumulatorMetadata, JsonProtocol, LongAccumulator, MetricUtils, SerializableConfiguration, Utils}
 import org.apache.spark.util.kvstore.InMemoryStore
 
 
@@ -369,7 +369,8 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
           "== Optimized Logical Plan ==", "== Physical Plan ==")),
         ("codegen", Seq("WholeStageCodegen subtrees")),
         ("cost", Seq("== Optimized Logical Plan ==", "Statistics(sizeInBytes")),
-        ("formatted", Seq("== Physical Plan ==", "Output", "Arguments"))).foreach {
+        ("formatted", Seq("== Physical Plan ==", "Output", "Arguments")),
+        ("none", Seq(SQLExecution.NO_PLAN_DESCRIPTION))).foreach {
       case (mode, expected) =>
         checkPlanDescription(mode, expected)
     }
@@ -511,6 +512,134 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
     assert(statusStore.execution(executionId).get.completionTime.nonEmpty)
   }
 
+  test("adaptive metric update after onExecutionEnd keeps the stored execution") {
+    val statusStore = createStatusStore()
+    val listener = statusStore.listener.get
+
+    val executionId = 0
+    val df = createTestDataFrame
+    val submissionTime = System.currentTimeMillis()
+    listener.onOtherEvent(SparkListenerSQLExecutionStart(
+      executionId,
+      Some(executionId),
+      "test",
+      "test",
+      df.queryExecution.toString,
+      SparkPlanInfo.fromSparkPlan(df.queryExecution.executedPlan),
+      submissionTime,
+      Map.empty))
+    listener.onJobStart(SparkListenerJobStart(
+      jobId = 0,
+      time = System.currentTimeMillis(),
+      stageInfos = Seq(createStageInfo(0, 0)),
+      createProperties(executionId)))
+    listener.onJobEnd(SparkListenerJobEnd(
+      jobId = 0,
+      time = System.currentTimeMillis(),
+      JobSucceeded))
+    listener.onOtherEvent(SparkListenerSQLExecutionEnd(
+      executionId, System.currentTimeMillis(), errorMessage = Some("Oops")))
+    assert(listener.noLiveData())
+    val ended = statusStore.execution(executionId).get
+
+    // An adaptive plan that outlives its execution, such as a shared inner CTE plan that its
+    // query abandoned, can post this after the execution ended.
+    val lateMetric =
+      SQLPlanMetric("late metric", AccumulatorContext.newId(), MetricUtils.SUM_METRIC)
+    listener.onOtherEvent(SparkListenerSQLAdaptiveSQLMetricUpdates(executionId, Seq(lateMetric)))
+
+    assert(listener.noLiveData())
+    val stored = statusStore.execution(executionId).get
+    assert(stored.description == "test")
+    assert(stored.physicalPlanDescription == ended.physicalPlanDescription)
+    assert(stored.submissionTime == submissionTime)
+    assert(stored.completionTime.nonEmpty && stored.completionTime == ended.completionTime)
+    assert(stored.errorMessage == Some("Oops"))
+    assertJobs(Some(stored), completed = Seq(0))
+    assert(stored.metricValues == ended.metricValues)
+    assert(stored.metrics.contains(lateMetric))
+  }
+
+  test("adaptive metric update after the ended execution's record is removed is dropped") {
+    val statusStore = createStatusStore()
+    val listener = statusStore.listener.get
+
+    val executionId = 0
+    val df = createTestDataFrame
+    listener.onOtherEvent(SparkListenerSQLExecutionStart(
+      executionId,
+      Some(executionId),
+      "test",
+      "test",
+      df.queryExecution.toString,
+      SparkPlanInfo.fromSparkPlan(df.queryExecution.executedPlan),
+      System.currentTimeMillis(),
+      Map.empty))
+    listener.onOtherEvent(SparkListenerSQLExecutionEnd(
+      executionId, System.currentTimeMillis()))
+    assert(listener.noLiveData())
+    assert(statusStore.execution(executionId).nonEmpty)
+    // As the retained-executions cleanup does once the execution is evicted.
+    kvstore.delete(classOf[SQLExecutionUIData], executionId.toLong)
+    assert(statusStore.execution(executionId).isEmpty)
+
+    // A shared inner CTE plan that its query abandoned can post this after that.
+    val lateMetric =
+      SQLPlanMetric("late metric", AccumulatorContext.newId(), MetricUtils.SUM_METRIC)
+    listener.onOtherEvent(SparkListenerSQLAdaptiveSQLMetricUpdates(executionId, Seq(lateMetric)))
+
+    assert(listener.noLiveData())
+    assert(statusStore.execution(executionId).isEmpty)
+  }
+
+  test("adaptive metric update of a running execution adds its metrics") {
+    val statusStore = createStatusStore()
+    val listener = statusStore.listener.get
+
+    val executionId = 0
+    val df = createTestDataFrame
+    listener.onOtherEvent(SparkListenerSQLExecutionStart(
+      executionId,
+      Some(executionId),
+      "test",
+      "test",
+      df.queryExecution.toString,
+      SparkPlanInfo.fromSparkPlan(df.queryExecution.executedPlan),
+      System.currentTimeMillis(),
+      Map.empty))
+    val metric =
+      SQLPlanMetric("adaptive metric", AccumulatorContext.newId(), MetricUtils.SUM_METRIC)
+    listener.onOtherEvent(SparkListenerSQLAdaptiveSQLMetricUpdates(executionId, Seq(metric)))
+    assert(!listener.noLiveData())
+
+    listener.onJobStart(SparkListenerJobStart(
+      jobId = 0,
+      time = System.currentTimeMillis(),
+      stageInfos = Seq(createStageInfo(0, 0)),
+      createProperties(executionId)))
+    listener.onStageSubmitted(SparkListenerStageSubmitted(createStageInfo(0, 0)))
+    listener.onTaskStart(SparkListenerTaskStart(0, 0, createTaskInfo(0, 0)))
+    listener.onTaskEnd(SparkListenerTaskEnd(
+      stageId = 0,
+      stageAttemptId = 0,
+      taskType = "",
+      reason = null,
+      createTaskInfo(0, 0, accums = Map(metric.accumulatorId -> 7L)),
+      new ExecutorMetrics,
+      null))
+    listener.onStageCompleted(SparkListenerStageCompleted(createStageInfo(0, 0)))
+    listener.onJobEnd(SparkListenerJobEnd(
+      jobId = 0,
+      time = System.currentTimeMillis(),
+      JobSucceeded))
+    listener.onOtherEvent(SparkListenerSQLExecutionEnd(
+      executionId, System.currentTimeMillis()))
+
+    assert(listener.noLiveData())
+    assert(statusStore.execution(executionId).get.description == "test")
+    assert(statusStore.executionMetrics(executionId).get(metric.accumulatorId) == Some("7"))
+  }
+
   test("handle one execution with multiple jobs") {
     val statusStore = createStatusStore()
     val listener = statusStore.listener.get
@@ -569,7 +698,6 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
 
   test("driver side SQL metrics") {
     val statusStore = spark.sharedState.statusStore
-    val oldCount = statusStore.executionsList().size
 
     val expectedAccumValue = 12345L
     val expectedAccumValue2 = 54321L
@@ -579,22 +707,12 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
       override lazy val executedPlan = physicalPlan
     }
 
-    SQLExecution.withNewExecutionId(dummyQueryExecution) {
-      physicalPlan.execute().collect()
+    val execId = runAndWaitForExecution {
+      SQLExecution.withNewExecutionId(dummyQueryExecution) {
+        physicalPlan.execute().collect()
+      }
     }
 
-    // Wait until the new execution is started and being tracked.
-    while (statusStore.executionsCount() < oldCount) {
-      Thread.sleep(100)
-    }
-
-    // Wait for listener to finish computing the metrics for the execution.
-    while (statusStore.executionsList().isEmpty ||
-        statusStore.executionsList().last.metricValues == null) {
-      Thread.sleep(100)
-    }
-
-    val execId = statusStore.executionsList().last.executionId
     val metrics = statusStore.executionMetrics(execId)
     val driverMetric = physicalPlan.metrics("dummy")
     val driverMetric2 = physicalPlan.metrics("dummy2")
@@ -844,7 +962,6 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
 
   test("SPARK-34338: Report metrics from Datasource v2 scan") {
     val statusStore = spark.sharedState.statusStore
-    val oldCount = statusStore.executionsList().size
 
     val schema = new StructType().add("i", "int").add("j", "int")
     val physicalPlan = BatchScanExec(toAttributes(schema), new CustomMetricScanBuilder(), Seq.empty,
@@ -854,22 +971,12 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
       override lazy val executedPlan = physicalPlan
     }
 
-    SQLExecution.withNewExecutionId(dummyQueryExecution) {
-      physicalPlan.execute().collect()
+    val execId = runAndWaitForExecution {
+      SQLExecution.withNewExecutionId(dummyQueryExecution) {
+        physicalPlan.execute().collect()
+      }
     }
 
-    // Wait until the new execution is started and being tracked.
-    while (statusStore.executionsCount() < oldCount) {
-      Thread.sleep(100)
-    }
-
-    // Wait for listener to finish computing the metrics for the execution.
-    while (statusStore.executionsList().isEmpty ||
-      statusStore.executionsList().last.metricValues == null) {
-      Thread.sleep(100)
-    }
-
-    val execId = statusStore.executionsList().last.executionId
     val metrics = statusStore.executionMetrics(execId)
     val expectedMetric = physicalPlan.metrics("custom_metric")
     val expectedValue = "custom_metric: 12345, 12345"
@@ -883,7 +990,6 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
 
   test("SPARK-39635: Report driver metrics from Datasource v2 scan") {
     val statusStore = spark.sharedState.statusStore
-    val oldCount = statusStore.executionsList().size
 
     val schema = new StructType().add("i", "int").add("j", "int")
     val physicalPlan = BatchScanExec(toAttributes(schema), new CustomDriverMetricScanBuilder(),
@@ -893,22 +999,12 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
       override lazy val executedPlan = physicalPlan
     }
 
-    SQLExecution.withNewExecutionId(dummyQueryExecution) {
-      physicalPlan.execute().collect()
+    val execId = runAndWaitForExecution {
+      SQLExecution.withNewExecutionId(dummyQueryExecution) {
+        physicalPlan.execute().collect()
+      }
     }
 
-    // Wait until the new execution is started and being tracked.
-    while (statusStore.executionsCount() < oldCount) {
-      Thread.sleep(100)
-    }
-
-    // Wait for listener to finish computing the metrics for the execution.
-    while (statusStore.executionsList().isEmpty ||
-      statusStore.executionsList().last.metricValues == null) {
-      Thread.sleep(100)
-    }
-
-    val execId = statusStore.executionsList().last.executionId
     val metrics = statusStore.executionMetrics(execId)
     val expectedMetric = physicalPlan.metrics("custom_driver_metric_partition_count")
     val expectedValue = "2"
@@ -919,25 +1015,14 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
   test("SPARK-36030: Report metrics from Datasource v2 write") {
     withTempDir { dir =>
       val statusStore = spark.sharedState.statusStore
-      val oldCount = statusStore.executionsList().size
 
       val cls = classOf[CustomMetricsDataSource].getName
-      spark.range(10).select($"id" as Symbol("i"), -$"id" as Symbol("j"))
-        .write.format(cls)
-        .option("path", dir.getCanonicalPath).mode("append").save()
-
-      // Wait until the new execution is started and being tracked.
-      eventually(timeout(10.seconds), interval(10.milliseconds)) {
-        assert(statusStore.executionsCount() >= oldCount)
+      val execId = runAndWaitForExecution {
+        spark.range(10).select($"id" as Symbol("i"), -$"id" as Symbol("j"))
+          .write.format(cls)
+          .option("path", dir.getCanonicalPath).mode("append").save()
       }
 
-      // Wait for listener to finish computing the metrics for the execution.
-      eventually(timeout(10.seconds), interval(10.milliseconds)) {
-        assert(statusStore.executionsList().nonEmpty &&
-          statusStore.executionsList().last.metricValues != null)
-      }
-
-      val execId = statusStore.executionsList().last.executionId
       val metrics = statusStore.executionMetrics(execId)
       val customMetric = metrics.find(_._2 == "custom_metric: 12345, 12345")
       val innerMetric = metrics.find(_._2 == "inner_metric: 54321, 54321")

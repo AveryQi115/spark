@@ -27,11 +27,12 @@ import org.apache.spark.connect.proto
 import org.apache.spark.connect.proto.{ExecutePlanResponse, PipelineCommandResult, Relation, ResolvedIdentifier}
 import org.apache.spark.connect.proto.PipelineCommand.DefineFlow.AutoCdcFlowDetails
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.{CATALOG_NAME, COMMAND, DATABASE_NAME}
 import org.apache.spark.sql.{AnalysisException, Column}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedRelation}
+import org.apache.spark.sql.catalyst.analysis.{PlanWithUnresolvedIdentifier, UnresolvedAttribute, UnresolvedExecuteImmediate, UnresolvedRelation}
 import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.catalyst.plans.logical.{Command, CreateNamespace, CreateTable, CreateTableAsSelect, CreateView, DescribeRelation, DescribeTablePartition, DropView, InsertIntoStatement, LogicalPlan, RenameTable, ShowColumns, ShowCreateTable, ShowFunctions, ShowTableProperties, ShowTables, ShowViews}
+import org.apache.spark.sql.catalyst.plans.logical.{Command, CreateNamespace, CreateTable, CreateTableAsSelect, CreateView, DescribeRelation, DescribeTablePartition, DropView, ExecutableDuringAnalysis, InsertIntoDir, InsertIntoStatement, LogicalPlan, RenameTable, ShowColumns, ShowCreateTable, ShowFunctions, ShowTableProperties, ShowTables, ShowViews, Union, UnresolvedInsert, UnresolvedWith}
 import org.apache.spark.sql.classic.ClassicConversions._
 import org.apache.spark.sql.connect.common.DataTypeProtoConverter
 import org.apache.spark.sql.connect.service.SessionHolder
@@ -83,12 +84,12 @@ private[connect] object PipelinesHandler extends Logging {
               .build())
           .build()
       case proto.PipelineCommand.CommandTypeCase.DROP_DATAFLOW_GRAPH =>
-        logInfo(s"Drop pipeline cmd received: $cmd")
+        logInfo(log"Drop pipeline cmd received: ${MDC(COMMAND, cmd)}")
         sessionHolder.dataflowGraphRegistry
           .dropDataflowGraph(cmd.getDropDataflowGraph.getDataflowGraphId)
         defaultResponse
       case proto.PipelineCommand.CommandTypeCase.DEFINE_OUTPUT =>
-        logInfo(s"Define pipelines output cmd received: $cmd")
+        logInfo(log"Define pipelines output cmd received: ${MDC(COMMAND, cmd)}")
         val resolvedDataset =
           defineOutput(cmd.getDefineOutput, sessionHolder)
         val identifierBuilder = ResolvedIdentifier.newBuilder()
@@ -105,7 +106,7 @@ private[connect] object PipelinesHandler extends Logging {
               .build())
           .build()
       case proto.PipelineCommand.CommandTypeCase.DEFINE_FLOW =>
-        logInfo(s"Define pipelines flow cmd received: $cmd")
+        logInfo(log"Define pipelines flow cmd received: ${MDC(COMMAND, cmd)}")
         val resolvedFlow =
           defineFlow(
             cmd.getDefineFlow,
@@ -128,11 +129,11 @@ private[connect] object PipelinesHandler extends Logging {
               .build())
           .build()
       case proto.PipelineCommand.CommandTypeCase.START_RUN =>
-        logInfo(s"Start pipeline cmd received: $cmd")
+        logInfo(log"Start pipeline cmd received: ${MDC(COMMAND, cmd)}")
         startRun(cmd.getStartRun, responseObserver, sessionHolder)
         defaultResponse
       case proto.PipelineCommand.CommandTypeCase.DEFINE_SQL_GRAPH_ELEMENTS =>
-        logInfo(s"Register sql datasets cmd received: $cmd")
+        logInfo(log"Register sql datasets cmd received: ${MDC(COMMAND, cmd)}")
         defineSqlGraphElements(cmd.getDefineSqlGraphElements, sessionHolder)
         defaultResponse
       case other => throw new UnsupportedOperationException(s"$other not supported")
@@ -150,6 +151,19 @@ private[connect] object PipelinesHandler extends Logging {
    * set of read-only operations (e.g., SHOW, DESCRIBE).
    */
   def blockUnsupportedSqlCommand(queryPlan: LogicalPlan): Unit = {
+    queryPlan match {
+      // The parser can leave a statement named by an IDENTIFIER clause, such as
+      // IDENTIFIER('a' || 'b'), unbuilt until analysis evaluates the clause. Build the statement
+      // with a placeholder name and check it instead.
+      case p: PlanWithUnresolvedIdentifier =>
+        blockUnsupportedSqlCommand(p.planBuilder(Seq("placeholder"), p.children))
+      // The parser puts a DML statement with a CTE prefix, such as WITH ... INSERT INTO ..., under
+      // UnresolvedWith and builds a multi-insert, FROM ... INSERT ... INSERT ..., as a Union of
+      // its INSERTs. Check the statements under them.
+      case w: UnresolvedWith => blockUnsupportedSqlCommand(w.child)
+      case u: Union => u.children.foreach(blockUnsupportedSqlCommand)
+      case _ =>
+    }
     val allowlistedCommands = Set(
       classOf[DescribeRelation],
       classOf[DescribeTablePartition],
@@ -168,11 +182,17 @@ private[connect] object PipelinesHandler extends Logging {
       // Disable all [[Command]] except the ones that are explicitly allowlisted
       // in "allowlistedCommands".
       queryPlan.isInstanceOf[Command] ||
+      // EXECUTE IMMEDIATE runs a SQL string that is parsed only during analysis, and CALL runs a
+      // procedure during analysis.
+      queryPlan.isInstanceOf[UnresolvedExecuteImmediate] ||
+      queryPlan.isInstanceOf[ExecutableDuringAnalysis] ||
       // Following commands are not subclasses of [[Command]] but have side effects.
       queryPlan.isInstanceOf[CreateTableAsSelect] ||
       queryPlan.isInstanceOf[CreateTable] ||
       queryPlan.isInstanceOf[CreateView] ||
       queryPlan.isInstanceOf[InsertIntoStatement] ||
+      queryPlan.isInstanceOf[UnresolvedInsert] ||
+      queryPlan.isInstanceOf[InsertIntoDir] ||
       queryPlan.isInstanceOf[RenameTable] ||
       queryPlan.isInstanceOf[CreateNamespace] ||
       queryPlan.isInstanceOf[DropView]
@@ -192,8 +212,8 @@ private[connect] object PipelinesHandler extends Logging {
       .getOrElse {
         val currentCatalog = sessionHolder.session.catalog.currentCatalog()
         logInfo(
-          "No default catalog was supplied. " +
-            s"Falling back to the current catalog: $currentCatalog.")
+          log"No default catalog was supplied. " +
+            log"Falling back to the current catalog: ${MDC(CATALOG_NAME, currentCatalog)}.")
         currentCatalog
       }
 
@@ -202,8 +222,8 @@ private[connect] object PipelinesHandler extends Logging {
       .getOrElse {
         val currentDatabase = sessionHolder.session.catalog.currentDatabase
         logInfo(
-          "No default database was supplied. " +
-            s"Falling back to the current database: $currentDatabase.")
+          log"No default database was supplied. " +
+            log"Falling back to the current database: ${MDC(DATABASE_NAME, currentDatabase)}.")
         currentDatabase
       }
 
@@ -429,9 +449,6 @@ private[connect] object PipelinesHandler extends Logging {
       transformExpressionFunc: proto.Expression => Expression): AutoCdcFlow = {
     // TODO(SPARK-57092): apply_as_truncates is declared on AutoCdcFlowDetails but is not yet
     //   honored by the engine; wire it through once SCD1 truncate support lands.
-    // TODO(SPARK-57093): ignore_null_updates_column_list and ignore_null_updates_except_column_list
-    //   are declared on AutoCdcFlowDetails but are not yet honored by the engine; wire them
-    //   through once SCD1 ignore-null support lands.
 
     if (!autoCdcDetails.hasSource) {
       throw new AnalysisException("AUTOCDC_MISSING_SOURCE", Map.empty)
@@ -511,6 +528,29 @@ private[connect] object PipelinesHandler extends Logging {
       throw new AnalysisException("AUTOCDC_TRACK_HISTORY_REQUIRES_SCD2", Map.empty)
     }
 
+    // Ignore-null (partial update) selection. The three inputs are mutually exclusive:
+    // ignore_null_updates (all columns), ignore_null_updates_column_list (an include list), and
+    // ignore_null_updates_except_column_list (an except list). "All columns" is represented as an
+    // ExcludeColumns selection with an empty list; this cannot be expressed via the repeated
+    // except field alone (an empty repeated field is indistinguishable from an unset one), which
+    // is why the dedicated boolean exists.
+    val ignoreNullSelection: Option[ColumnSelection] = {
+      val all = autoCdcDetails.getIgnoreNullUpdates
+      val included = autoCdcDetails.getIgnoreNullUpdatesColumnListList.asScala.toSeq
+      val excluded = autoCdcDetails.getIgnoreNullUpdatesExceptColumnListList.asScala.toSeq
+      if (Seq(all, included.nonEmpty, excluded.nonEmpty).count(identity) > 1) {
+        throw new AnalysisException("AUTOCDC_CONFLICTING_IGNORE_NULL_UPDATES_OPTIONS", Map.empty)
+      } else if (all) {
+        Some(ColumnSelection.ExcludeColumns(Seq.empty))
+      } else if (included.nonEmpty) {
+        Some(ColumnSelection.IncludeColumns(included.map(asUnqualifiedColumnName)))
+      } else if (excluded.nonEmpty) {
+        Some(ColumnSelection.ExcludeColumns(excluded.map(asUnqualifiedColumnName)))
+      } else {
+        None
+      }
+    }
+
     val changeArgs = ChangeArgs(
       keys = keys,
       sequencing = toColumn(autoCdcDetails.getSequenceBy),
@@ -518,7 +558,8 @@ private[connect] object PipelinesHandler extends Logging {
       deleteCondition =
         Option.when(autoCdcDetails.hasApplyAsDeletes)(toColumn(autoCdcDetails.getApplyAsDeletes)),
       columnSelection = columnSelection,
-      trackHistorySelection = trackHistorySelection)
+      trackHistorySelection = trackHistorySelection,
+      ignoreNullSelection = ignoreNullSelection)
 
     AutoCdcFlow(
       identifier = flowIdentifier,

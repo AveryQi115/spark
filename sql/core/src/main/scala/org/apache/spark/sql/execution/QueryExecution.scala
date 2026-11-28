@@ -34,20 +34,22 @@ import org.apache.spark.sql.catalyst.{InternalRow, QueryPlanningTracker}
 import org.apache.spark.sql.catalyst.analysis.{Analyzer, LazyExpression, NameParameterizedQuery, UnsupportedOperationChecker}
 import org.apache.spark.sql.catalyst.expressions.codegen.ByteCodeStats
 import org.apache.spark.sql.catalyst.plans.QueryPlan
-import org.apache.spark.sql.catalyst.plans.logical.{AppendData, Command, CommandResult, CompoundBody, CreateTableAsSelect, LogicalPlan, OverwriteByExpression, OverwritePartitionsDynamic, ReplaceTableAsSelect, ReturnAnswer, Union, UnresolvedWith, WithCTE}
+import org.apache.spark.sql.catalyst.plans.logical.{AppendData, Command, CommandResult, CompoundBody, CreateTableAsSelect, LogicalPlan, OverwriteByExpression, OverwritePartitionsDynamic, ReplaceTableAsSelect, ReturnAnswer, Union, UnresolvedInsert, UnresolvedWith, WithCTE}
 import org.apache.spark.sql.catalyst.rules.{PlanChangeLogger, Rule, RuleExecutor}
 import org.apache.spark.sql.catalyst.transactions.TransactionUtils
+import org.apache.spark.sql.catalyst.trees.TreePattern.CTE_REUSE
 import org.apache.spark.sql.catalyst.util.StringUtils.PlanStringConcat
 import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.connector.catalog.LookupCatalog
 import org.apache.spark.sql.connector.catalog.transactions.Transaction
 import org.apache.spark.sql.execution.SQLExecution.EXECUTION_ROOT_ID_KEY
-import org.apache.spark.sql.execution.adaptive.{AdaptiveExecutionContext, InsertAdaptiveSparkPlan}
+import org.apache.spark.sql.execution.adaptive.{AdaptiveExecutionContext, AdaptiveSparkPlanExec, InsertAdaptiveSparkPlan, QueryStageExec}
 import org.apache.spark.sql.execution.bucketing.{CoalesceBucketsInJoin, DisableUnnecessaryBucketedScan}
 import org.apache.spark.sql.execution.datasources.v2.{TransactionalExec, V2TableRefreshUtil}
 import org.apache.spark.sql.execution.dynamicpruning.PlanDynamicPruningFilters
-import org.apache.spark.sql.execution.exchange.EnsureRequirements
+import org.apache.spark.sql.execution.exchange.{EnablePipelinedShuffle, EnsureRequirements, PipelinedShuffleEligibility, ShuffleExchangeExec, UnwrapCTEReuseExchange, VerifyCTEReuse}
+import org.apache.spark.sql.execution.joins.ChoosePerPartitionRuntimeFilters
 import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 import org.apache.spark.sql.execution.streaming.checkpointing.OffsetSeqMetadata
 import org.apache.spark.sql.execution.streaming.runtime.{IncrementalExecution, WatermarkPropagator}
@@ -99,6 +101,33 @@ class QueryExecution(
     logical.exists(_.expressions.exists(_.exists(_.isInstanceOf[LazyExpression])))
   }
 
+  // Legacy constant-only parameter substitution wraps the plan in a ParameterizedQuery. Its
+  // parameters bind during analysis, after transaction selection, so INSERT IDENTIFIER parameters
+  // are intentionally not handled here and remain a known limitation.
+  private val lazyLogicalWithResolvedInsert = LazyTry {
+    def resolve(insert: UnresolvedInsert): LogicalPlan = {
+      try {
+        executePhase(QueryPlanningTracker.ANALYSIS) {
+          QueryPlanningTracker.withTracker(tracker) {
+            analyzerOpt.getOrElse(sparkSession.sessionState.analyzer)
+              .resolveUnresolvedInsert(insert)
+          }
+        }
+      } catch {
+        case NonFatal(e) =>
+          tracker.setAnalysisFailed(logical)
+          throw e
+      }
+    }
+
+    logical match {
+      case unresolvedWith @ UnresolvedWith(insert: UnresolvedInsert, _, _) =>
+        unresolvedWith.copy(child = resolve(insert))
+      case insert: UnresolvedInsert => resolve(insert)
+      case other => other
+    }
+  }
+  private def logicalWithResolvedInsert: LogicalPlan = lazyLogicalWithResolvedInsert.get
 
   // 1. At the pre-Analyzed plan we look for nodes that implement the TransactionalWrite trait.
   //    When a plan contains such a node we initiate a transaction. Note, we should never start
@@ -116,7 +145,7 @@ class QueryExecution(
     analyzerOpt.flatMap(_.catalogManager.transaction).orElse {
       // Only begin a new transaction for outer QEs that lead to execution.
       if (mode != CommandExecutionMode.SKIP) {
-        val catalog = logical match {
+        val catalog = logicalWithResolvedInsert match {
           case UnresolvedWith(TransactionalWrite(c), _, _) => Some(c)
           case TransactionalWrite(c) => Some(c)
           case _ => None
@@ -181,7 +210,7 @@ class QueryExecution(
         SqlScriptingExecution.executeSqlScript(
           session = sparkSession,
           script = compoundBody)
-      case _ => logical
+      case _ => logicalWithResolvedInsert
     }
   }
 
@@ -252,16 +281,14 @@ class QueryExecution(
         result.toImmutableArraySeq)
     }
     p transformDown {
-      case u @ Union(children, _, _) if children.forall(_.isInstanceOf[Command]) =>
-        eagerlyExecute(u, "multi-commands", CommandExecutionMode.SKIP)
-      case w @ WithCTE(u @ Union(children, _, _), _) if children.forall(_.isInstanceOf[Command]) =>
-        eagerlyExecute(w, "multi-commands", CommandExecutionMode.SKIP)
-      case c: Command =>
-        val name = commandExecutionName(c)
-        eagerlyExecute(c, name, CommandExecutionMode.NON_ROOT)
-      case w @ WithCTE(c: Command, _) =>
-        val name = commandExecutionName(c)
-        eagerlyExecute(w, name, CommandExecutionMode.SKIP)
+      // isEagerlyExecutedCommand decides the shapes; this only maps each to a name and mode.
+      case node if QueryExecution.isEagerlyExecutedCommand(node) =>
+        val (name, mode) = node match {
+          case c: Command => (commandExecutionName(c), CommandExecutionMode.NON_ROOT)
+          case WithCTE(c: Command, _) => (commandExecutionName(c), CommandExecutionMode.SKIP)
+          case _ => ("multi-commands", CommandExecutionMode.SKIP) // Union / WithCTE(Union)
+        }
+        eagerlyExecute(node, name, mode)
     }
   }
 
@@ -382,6 +409,34 @@ class QueryExecution(
 
   def assertExecutedPlanPrepared(): Unit = executedPlan
 
+  /**
+   * RDD consumers and partition-at-a-time iterators can outlive one SQL job. Give them a
+   * separate plan whose shuffles retain output, without changing this execution's plan.
+   * Reuse one fallback per execution and retain its session for lazy planning and AQE.
+   * Closing that session here would stop the shared SparkContext.
+   */
+  private val lazyRegularShuffle = LazyTry {
+    def hasShuffle(plan: SparkPlan): Boolean = plan match {
+      case _: ShuffleExchangeExec => true
+      case a: AdaptiveSparkPlanExec => hasShuffle(a.executedPlan)
+      case q: QueryStageExec => hasShuffle(q.plan)
+      case other => other.children.exists(hasShuffle)
+    }
+    if (!sparkSession.sessionState.conf.localPipelinedShuffleEnabled ||
+        !PipelinedShuffleEligibility.enabled(executedPlan, sparkSession.sessionState.conf) ||
+        !hasShuffle(executedPlan)) {
+      this
+    } else {
+      val session = SparkSession.getOrCloneSessionWithConfigsOff(
+        sparkSession, Seq(SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED))
+      new QueryExecution(session, commandExecuted, mode = mode,
+        shuffleCleanupModeOpt = shuffleCleanupModeOpt,
+        refreshPhaseEnabled = refreshPhaseEnabled, analyzerOpt = Some(analyzer))
+    }
+  }
+
+  private[sql] def withRegularShuffle: QueryExecution = lazyRegularShuffle.get
+
   val lazyToRdd = LazyTry {
     new SQLExecutionRDD(
       executedPlan.execute(),
@@ -413,8 +468,18 @@ class QueryExecution(
 
   protected def preparations: Seq[Rule[SparkPlan]] = {
     QueryExecution.preparations(sparkSession,
-      Option(InsertAdaptiveSparkPlan(AdaptiveExecutionContext(sparkSession, this))), false)
+      Option(InsertAdaptiveSparkPlan(AdaptiveExecutionContext(sparkSession, this))), false,
+      verifyCTEReuse = hasCTEReuse)
   }
+
+  /**
+   * Whether the optimized plan, subqueries included, seals a CTE for guaranteed reuse. Only such a
+   * plan can hold a `LOCAL_SHUFFLE_FOR_CTE` shuffle, so only its preparation needs
+   * [[VerifyCTEReuse]]; every other query, including each streaming micro-batch and every query
+   * with the reuse flag off, skips that traversal. Subquery expressions propagate the pattern of
+   * their plans.
+   */
+  private def hasCTEReuse: Boolean = optimizedPlan.containsPattern(CTE_REUSE)
 
   protected def executePhase[T](phase: String)(block: => T): T = sparkSession.withActive {
     QueryExecution.withInternalError(s"The Spark SQL phase $phase failed with an internal error.") {
@@ -741,6 +806,20 @@ object QueryExecution {
 
   private def nextExecutionId: Long = _nextExecutionId.getAndIncrement
 
+  /**
+   * Whether [[QueryExecution.eagerlyExecuteCommands]] would eagerly execute `plan` as a command:
+   * a `Command`, a `Union` of commands, or either wrapped in a `WithCTE`. The single source of
+   * truth for those shapes, gated on by `eagerlyExecuteCommands`. EXECUTE IMMEDIATE uses it to
+   * defer matching inner payloads to the execution level.
+   */
+  private[sql] def isEagerlyExecutedCommand(plan: LogicalPlan): Boolean = plan match {
+    case Union(children, _, _) => children.forall(_.isInstanceOf[Command])
+    case WithCTE(Union(children, _, _), _) => children.forall(_.isInstanceOf[Command])
+    case _: Command => true
+    case WithCTE(_: Command, _) => true
+    case _ => false
+  }
+
   private[execution] def create(
       sparkSession: SparkSession,
       logical: LogicalPlan,
@@ -762,16 +841,39 @@ object QueryExecution {
   private[execution] def preparations(
       sparkSession: SparkSession,
       adaptiveExecutionRule: Option[InsertAdaptiveSparkPlan] = None,
-      subquery: Boolean): Seq[Rule[SparkPlan]] = {
+      subquery: Boolean,
+      verifyCTEReuse: Boolean = false): Seq[Rule[SparkPlan]] = {
+    // Read once here so that both union barriers below, and the codegen gate they stamp for, answer
+    // from the same values however long preparation takes.
+    val unionConf = UnionConfSnapshot(sparkSession.sessionState.conf)
+    val ensureRequirements = EnsureRequirements()
     // `AdaptiveSparkPlanExec` is a leaf node. If inserted, all the following rules will be no-op
     // as the original plan is hidden behind `AdaptiveSparkPlanExec`.
     adaptiveExecutionRule.toSeq ++
     Seq(
+      // Unwrap CTEReuseExchange nodes first (AQE off): a sealed CTE body is a data field of the
+      // leaf until then, so every preparation rule that must see a CTE body has to run after this
+      // one. `CoalesceBucketsInJoin` then coalesces the joins inside a body, a
+      // `DynamicPruningSubquery` inside a body is planned by `PlanDynamicPruningFilters` (otherwise
+      // it is left unplanned and fails at execution), and `ChoosePerPartitionRuntimeFilters` sees
+      // the semi joins inside a body. Runs in both main and subquery passes so CTE references
+      // inside subqueries are also unwrapped.
+      UnwrapCTEReuseExchange,
       CoalesceBucketsInJoin,
+      // Must run before `EnsureRequirements`, which then plans the query without the semi joins
+      // this rule drops.
+      ChoosePerPartitionRuntimeFilters(ensureRequirements, unionConf),
       PlanDynamicPruningFilters(sparkSession),
       PlanSubqueries(sparkSession),
       RemoveRedundantProjects,
-      EnsureRequirements(),
+      // Must run before `EnsureRequirements`, which asks a `UnionExec` what it reports: it
+      // records the conf that answer depends on, so the following `StampUnionDecisions` freezes the
+      // decision under the same value the exchanges were planned against.
+      new SnapshotUnionPreparationConf(unionConf),
+      ensureRequirements,
+      // Must run after `EnsureRequirements`: it fixes each `UnionExec`'s partitioning decision, and
+      // the answer to fix is the one the exchanges around it were planned against.
+      new StampUnionDecisions(unionConf),
       // This rule must be run after `EnsureRequirements`.
       InsertSortForLimitAndOffset,
       // `PushDownLocalSort` pushes a wider local sort down onto a narrower one below it, so a
@@ -796,13 +898,31 @@ object QueryExecution {
       // see `AdaptiveSparkPlanExec.queryStagePreparationRules`.)
       RemoveRedundantSorts,
       ApplyColumnarRulesAndInsertTransitions(
-        sparkSession.sessionState.columnarRules, outputsColumnar = false),
+        SnapshotUnionPreparationConf.after(unionConf, sparkSession.sessionState.columnarRules),
+        outputsColumnar = false),
+      // A barrier for a `UnionExec` an injected columnar rule just created, which has no decision
+      // yet and would otherwise take one wherever it is first asked. A decision already stamped on
+      // a node is kept.
+      new StampUnionDecisions(unionConf),
       CollapseCodegenStages()) ++
       (if (subquery) {
         Nil
       } else {
-        Seq(ReuseExchangeAndSubquery)
-      })
+        // VerifyCTEReuse runs only on the main query (not per-subquery) after
+        // ReuseExchangeAndSubquery, to verify guaranteed CTE shuffle reuse held (AQE off), and only
+        // when the caller found a sealed CTE in the optimized plan.
+        Seq(ReuseExchangeAndSubquery) ++
+          (if (verifyCTEReuse) {
+            Seq(VerifyCTEReuse(failOnReuseFailure =
+              sparkSession.sessionState.conf.getConf(SQLConf.FAIL_ON_CTE_REUSE_WITHOUT_AQE)))
+          } else {
+            Nil
+          })
+      }) ++
+      // Opt-in (SPARK-57399): runs last so it observes the final reuse decision (a reused
+      // exchange means fan-out, which it refuses to make pipelined).
+      // No-op unless spark.sql.shuffle.localPipelined.enabled=true and AQE is off.
+      Seq(EnablePipelinedShuffle)
   }
 
   /**
@@ -957,7 +1077,8 @@ object QueryExecution {
       refreshPhaseEnabled: Boolean = true,
       mode: CommandExecutionMode.Value = CommandExecutionMode.SKIP,
       shuffleCleanupModeOpt: Option[ShuffleCleanupMode] = None,
-      analyzerOpt: Option[Analyzer] = None)
+      analyzerOpt: Option[Analyzer] = None,
+      beforeExecution: SparkPlan => Unit = _ => ())
     : (QueryExecution, Array[InternalRow]) = {
     val qe = new QueryExecution(
       sparkSession,
@@ -968,6 +1089,7 @@ object QueryExecution {
       analyzerOpt = analyzerOpt)
     val result = QueryExecution.withInternalError(s"Executed $name failed.") {
       SQLExecution.withNewExecutionId(qe, Some(name)) {
+        beforeExecution(qe.executedPlan)
         qe.executedPlan.executeCollect()
       }
     }

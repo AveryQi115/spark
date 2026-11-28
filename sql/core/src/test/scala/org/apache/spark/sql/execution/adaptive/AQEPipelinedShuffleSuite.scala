@@ -1,0 +1,336 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.execution.adaptive
+
+import java.util.concurrent.{Executors, TimeUnit}
+
+import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.{classic, DataFrame, SparkSession}
+import org.apache.spark.sql.catalyst.plans.logical.CTERelationDef
+import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.exchange.{CTEReuseExchange, PipelinedShuffleTestSession, ShuffleExchangeExec}
+import org.apache.spark.sql.internal.SQLConf
+
+/** End-to-end coverage of channel eligibility and regular-shuffle fallbacks under AQE. */
+class AQEPipelinedShuffleSuite extends SparkFunSuite
+  with AdaptiveSparkPlanHelper with PipelinedShuffleTestSession {
+
+  private def withAqePipelinedSession(body: SparkSession => Unit): Unit =
+    withPipelinedSession("aqe-pipelined-shuffle", aqe = true)(body)
+
+  private def pipelinedExchanges(plan: org.apache.spark.sql.execution.SparkPlan) =
+    collect(plan) { case s: ShuffleExchangeExec if s.pipelined => s }
+
+  private def materializedStages(plan: org.apache.spark.sql.execution.SparkPlan) =
+    collect(plan) { case q: ShuffleQueryStageExec => q }
+
+  test("single-exchange aggregate pipelines the whole final job under AQE") {
+    withAqePipelinedSession { spark =>
+      import spark.implicits._
+      // Keep ONE Dataset for both execution and plan inspection: .as[...] creates a new
+      // QueryExecution, and asserting on an unexecuted sibling would see the initial
+      // adaptive plan (isFinalPlan=false), not the executed one.
+      val ds = spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 7))
+        .groupBy($"k").count().as[(Long, Long)]
+
+      val counts = ds.collect().toMap
+      val plan = ds.queryExecution.executedPlan
+      assert(pipelinedExchanges(plan).nonEmpty,
+        s"expected the sole exchange pipelined; plan:\n$plan")
+      assert(materializedStages(plan).isEmpty,
+        s"no exchange should have materialized as a stage; plan:\n$plan")
+      val expected = (0L until 1000L).groupBy(_ % 7).map { case (k, vs) => (k, vs.size.toLong) }
+      assert(counts === expected)
+    }
+  }
+
+  test("an AQE regular prefix remains recoverable across repeated actions") {
+    withAqePipelinedSession { spark =>
+      import spark.implicits._
+      val ds = spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 7))
+        .groupBy($"k").count().orderBy($"k").as[(Long, Long)]
+
+      val rows = ds.collect()
+      val plan = ds.queryExecution.executedPlan
+      assert(pipelinedExchanges(plan).isEmpty,
+        s"a regular prefix must not feed a pipelined tail; plan:\n$plan")
+      assert(materializedStages(plan).nonEmpty,
+        s"expected the groupBy exchange materialized as a regular stage; plan:\n$plan")
+      val expected = (0L until 1000L).groupBy(_ % 7).map { case (k, vs) => (k, vs.size.toLong) }
+        .toSeq.sortBy(_._1)
+      assert(rows.toSeq === expected)
+      // Local cleanup unregisters the output; the next action recomputes unavailable stages.
+      // This exercises repeated regular execution, not a FetchFailed retry.
+      assert(ds.collect().toSeq === expected)
+      assert(ds.collect().toSeq === expected)
+    }
+  }
+
+  test("shuffled join inputs flip as a symmetric pair under AQE") {
+    withAqePipelinedSession { spark =>
+      import spark.implicits._
+      // Keep the join a shuffled join: disable both static and adaptive broadcast switching.
+      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "-1")
+      val left = spark.range(0, 200, 1, 2).withColumn("k", ($"id" % 10))
+        .select($"k", $"id".as("lv"))
+      val right = spark.range(0, 120, 1, 2).withColumn("k", ($"id" % 6))
+        .select($"k", $"id".as("rv"))
+      val joined = left.join(right, "k")
+        .select($"k", $"lv", $"rv").as[(Long, Long, Long)]
+
+      val rows = joined.collect()
+      val plan = joined.queryExecution.executedPlan
+      assert(pipelinedExchanges(plan).size === 2,
+        s"expected both join inputs pipelined as a pair; plan:\n$plan")
+
+      val l = (0L until 200L).map(i => (i % 10, i))
+      val r = (0L until 120L).map(i => (i % 6, i))
+      val expected = (for ((lk, lv) <- l; (rk, rv) <- r if lk == rk) yield (lk, lv, rv)).toSet
+      assert(rows.toSet === expected)
+    }
+  }
+
+  test("default shuffle width retains regular AQE execution") {
+    withPipelinedSession("aqe-pipelined-default-width", aqe = true, cores = 8) { spark =>
+      import spark.implicits._
+      spark.conf.unset("spark.sql.shuffle.partitions")
+      assert(spark.conf.get("spark.sql.shuffle.partitions") === "200")
+      val ds = spark.range(0, 1000, 1, 2).groupBy(($"id" % 7).as("k")).count()
+      assert(ds.collect().map(_.getLong(1)).sum === 1000L)
+      assert(pipelinedExchanges(ds.queryExecution.executedPlan).isEmpty)
+      assert(materializedStages(ds.queryExecution.executedPlan).nonEmpty)
+    }
+  }
+
+  test("results match the regular AQE baseline on the prefix + tail shape") {
+    withAqePipelinedSession { spark =>
+      import spark.implicits._
+      def run(): Seq[(Long, Long)] = {
+        spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 13))
+          .groupBy($"k").count().orderBy($"k".desc)
+          .as[(Long, Long)].collect().toSeq
+      }
+      spark.conf.set("spark.sql.shuffle.localPipelined.enabled", "false")
+      val baseline = run()
+      spark.conf.set("spark.sql.shuffle.localPipelined.enabled", "true")
+      val pipelined = run()
+      assert(pipelined === baseline)
+    }
+  }
+
+  test("coalesce over a shuffle stays regular under AQE") {
+    // A CoalesceExec reading from a shuffle drains several reduce partitions per task (a
+    // CoalescedRDD over the ShuffledRowRDD), which the channel transport cannot serve without
+    // deadlocking (see EnablePipelinedShuffle / ChannelShuffleReader). AQEEnablePipelinedShuffle
+    // blocks below a CoalesceExec (it is stats-sensitive for this purpose), so the shuffle it
+    // reads -- and everything deeper -- stays regular. The query still runs correctly. Guard with
+    // a deadline so a regression (the shuffle went pipelined and the coalesced read hung) surfaces
+    // as a failure rather than a hung suite.
+    val pool = Executors.newSingleThreadExecutor()
+    val fut = pool.submit(new Runnable {
+      override def run(): Unit = withAqePipelinedSession { spark =>
+        import spark.implicits._
+        // Enough rows that a regression would fill a bounded queue and truly deadlock, not fit.
+        val ds = spark.range(0, 2000000L, 1, 4).withColumn("k", ($"id" % 10))
+          .groupBy($"k").count().coalesce(2).as[(Long, Long)]
+        val n = ds.collect().length
+        require(n == 10, s"expected 10 groups, got $n")
+        val plan = ds.queryExecution.executedPlan
+        require(pipelinedExchanges(plan).isEmpty,
+          s"coalesce over a shuffle must stay regular under AQE; found a pipelined exchange:" +
+            s"\n$plan")
+      }
+    })
+    try {
+      fut.get(90, TimeUnit.SECONDS)
+    } catch {
+      case _: java.util.concurrent.TimeoutException =>
+        fut.cancel(true)
+        fail("coalesce over a pipelined shuffle hung under AQE: the shuffle was pipelined " +
+          "despite a coalesce reading it, and the coalesced read deadlocked the writer")
+    } finally {
+      pool.shutdownNow()
+    }
+  }
+
+  test("SPARK-60497: an AQE shuffle over a pipelined toRdd is rejected instead of hanging") {
+    withAqePipelinedSession { spark =>
+      import spark.implicits._
+      val inner = spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 7)).groupBy($"k").count()
+      // QueryExecution.toRdd runs the inner plan as planned: its only exchange is pipelined.
+      val rows = inner.queryExecution.toRdd
+        .map(r => org.apache.spark.sql.Row(r.getLong(0), r.getLong(1)))
+      assert(pipelinedExchanges(inner.queryExecution.executedPlan).nonEmpty)
+      // The outer plan scans an RDD, so its exchange stays regular, and AQE materializes it with a
+      // map-stage job that depends on the inner pipelined shuffle. The scheduler rejects that job
+      // up front. Collect under a deadline so that a regression (the job's channel tasks killed
+      // and relaunched forever) fails here instead of hanging the suite.
+      val outer = spark.createDataFrame(rows, inner.schema).groupBy($"count").count()
+      val pool = Executors.newSingleThreadExecutor()
+      try {
+        val fut = pool.submit(new java.util.concurrent.Callable[Int] {
+          override def call(): Int = outer.collect().length
+        })
+        intercept[java.util.concurrent.ExecutionException] {
+          fut.get(90, TimeUnit.SECONDS)
+        }.getCause match {
+          case e: org.apache.spark.SparkException =>
+            checkError(
+              exception = e,
+              condition = "PIPELINED_SHUFFLE_UNSUPPORTED",
+              sqlState = Some("0A000"),
+              parameters = Map("reason" -> "a map-stage job that depends on a pipelined shuffle"))
+          case other => fail(s"expected a SparkException, got $other", other)
+        }
+      } finally {
+        spark.sparkContext.cancelAllJobs()
+        pool.shutdownNow()
+      }
+      // The inner pipelined query still runs.
+      assert(inner.collect().map(_.getLong(1)).sum === 1000L)
+    }
+  }
+
+  test("a shared forced CTE stays regular across repeated actions") {
+    withAqePipelinedSession { spark =>
+      val session = spark.asInstanceOf[classic.SparkSession]
+      session.conf.set(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key, "-1")
+      session.conf.set(SQLConf.ADAPTIVE_AUTO_BROADCASTJOIN_THRESHOLD.key, "-1")
+      // forceSkipInline has no SQL syntax: tag the analyzed CTE definition and re-run it.
+      val analyzed = session.sql(
+        """WITH cte AS (SELECT id AS k, rand() AS r FROM range(0, 100, 1, 2))
+          |SELECT c1.k, c1.r = c2.r AS same FROM cte c1 JOIN cte c2 ON c1.k = c2.k
+          |""".stripMargin).queryExecution.analyzed
+      val df = classic.Dataset.ofRows(session, analyzed.transformWithSubqueries {
+        case d: CTERelationDef => d.copy(forceSkipInline = true)
+      })
+      val expected = (0L until 100L).map(k => (k, true))
+      def run(): Seq[(Long, Boolean)] =
+        df.collect().map(r => (r.getLong(0), r.getBoolean(1))).toSeq.sortBy(_._1)
+      assert(run() === expected)
+      val plan = df.queryExecution.executedPlan
+      val cteStages = collect(plan) { case s: CTEReuseQueryStageExec => s }
+      assert(cteStages.size == 2, s"expected two CTE reuse stages; plan:\n$plan")
+      cteStages.foreach { s =>
+        val root = s.innerAQE.executedPlan match {
+          case r: AQEShuffleReadExec => r.child
+          case other => other
+        }
+        assert(root.isInstanceOf[ShuffleQueryStageExec],
+          s"expected the shared inner plan to root at a regular shuffle stage; plan:\n$plan")
+      }
+      assert(pipelinedExchanges(plan).isEmpty,
+        s"no exchange of a plan reading a CTE reuse stage may be pipelined; plan:\n$plan")
+      // The second collect of the same DataFrame must succeed with the same rows.
+      assert(run() === expected)
+    }
+  }
+
+  test("the initial adaptive plan of a join of forced CTE references stays regular") {
+    withAqePipelinedSession { spark =>
+      val session = spark.asInstanceOf[classic.SparkSession]
+      session.conf.set(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key, "-1")
+      session.conf.set(SQLConf.ADAPTIVE_AUTO_BROADCASTJOIN_THRESHOLD.key, "-1")
+      // The plan the AQE preparation rules, this rule included, give the query before any stage
+      // is created.
+      def initialPlan(df: DataFrame): SparkPlan = df.queryExecution.executedPlan match {
+        case a: AdaptiveSparkPlanExec => a.initialPlan
+        case other => fail(s"expected an adaptive plan; plan:\n$other")
+      }
+      val range = "range(0, 100, 1, 2)"
+      // Without a CTE, each shape pipelines both join inputs in its initial plan. A self-join's
+      // two inputs are canonically equal, which leaves them regular while exchange reuse is on,
+      // so it runs with exchange reuse off.
+      Seq(
+        ("a self-join", false,
+          s"""SELECT a.k FROM (SELECT id AS k FROM $range) a
+             |JOIN (SELECT id AS k FROM $range) b ON a.k = b.k""".stripMargin,
+          "SELECT c1.k FROM cte c1 JOIN cte c2 ON c1.k = c2.k", 100),
+        ("a join of differently projected references", true,
+          s"""SELECT a.k FROM (SELECT id AS k FROM $range) a
+             |JOIN (SELECT id + 1 AS k FROM $range) b ON a.k = b.k""".stripMargin,
+          "SELECT c1.k FROM cte c1 JOIN (SELECT k + 1 AS k FROM cte) c2 ON c1.k = c2.k", 99)
+      ).foreach { case (name, reuse, control, query, numRows) =>
+        session.conf.set(SQLConf.EXCHANGE_REUSE_ENABLED.key, reuse.toString)
+        val controlPlan = initialPlan(session.sql(control))
+        assert(pipelinedExchanges(controlPlan).size == 2,
+          s"$name: expected the control's join inputs pipelined; plan:\n$controlPlan")
+
+        // forceSkipInline has no SQL syntax: tag the analyzed CTE definition and re-run it.
+        val analyzed = session.sql(s"WITH cte AS (SELECT id AS k FROM $range) $query")
+          .queryExecution.analyzed
+        val df = classic.Dataset.ofRows(session, analyzed.transformWithSubqueries {
+          case d: CTERelationDef => d.copy(forceSkipInline = true)
+        })
+        // Before stage creation, the join inputs are exchanges over the CTE references, which
+        // are still CTEReuseExchange leaves rather than CTE reuse stages.
+        val initial = initialPlan(df)
+        val overReferences = collect(initial) {
+          case s: ShuffleExchangeExec if s.child.exists(_.isInstanceOf[CTEReuseExchange]) => s
+        }
+        assert(overReferences.size == 2,
+          s"$name: expected both join inputs to read a CTE reference; plan:\n$initial")
+        assert(pipelinedExchanges(initial).isEmpty,
+          s"$name: no exchange of a plan reading a CTE reference may be pipelined; plan:\n$initial")
+        assert(df.collect().length == numRows)
+      }
+    }
+  }
+
+  test("an eligible exchange beside a branch that reads CTE reuse stages stays regular") {
+    withAqePipelinedSession { spark =>
+      val session = spark.asInstanceOf[classic.SparkSession]
+      // Every branch of the union is single-partition, so the union reports a single partition
+      // and its plan fits the local capacity check.
+      session.conf.set(SQLConf.UNION_OUTPUT_PARTITIONING.key, "true")
+      // Without a CTE, the same shape pipelines its exchanges: the count's exchange is eligible.
+      val control = session.sql(
+        """SELECT id AS k FROM (SELECT /*+ REPARTITION(1) */ id FROM range(0, 100, 1, 2))
+          |UNION ALL SELECT count(*) AS k FROM range(0, 1000, 1, 2)
+          |""".stripMargin)
+      assert(control.collect().map(_.getLong(0)).sorted.toSeq === (0L until 100L) :+ 1000L)
+      assert(pipelinedExchanges(control.queryExecution.executedPlan).nonEmpty,
+        s"expected the control to pipeline; plan:\n${control.queryExecution.executedPlan}")
+
+      // The count's exchange reads no CTE reference. It is staged together with the CTE
+      // references, which are still unstaged CTEReuseExchange leaves in the initial plan, so the
+      // regular-prefix guard for those leaves keeps it regular; AQEEnablePipelinedShuffleRuleSuite
+      // covers the guard for CTE reuse stages on a hand-built plan.
+      val analyzed = session.sql(
+        """WITH cte AS (SELECT /*+ REPARTITION(1) */ id AS k, rand() AS r FROM range(0, 100, 1, 2))
+          |SELECT k FROM cte
+          |UNION ALL SELECT k FROM cte
+          |UNION ALL SELECT count(*) AS k FROM range(0, 1000, 1, 2)
+          |""".stripMargin).queryExecution.analyzed
+      val df = classic.Dataset.ofRows(session, analyzed.transformWithSubqueries {
+        case d: CTERelationDef => d.copy(forceSkipInline = true)
+      })
+      val expected = ((0L until 100L) ++ (0L until 100L) :+ 1000L).sorted
+      def run(): Seq[Long] = df.collect().map(_.getLong(0)).toSeq.sorted
+      assert(run() === expected)
+      val plan = df.queryExecution.executedPlan
+      assert(collect(plan) { case s: CTEReuseQueryStageExec => s }.size == 2,
+        s"expected two CTE reuse stages; plan:\n$plan")
+      assert(pipelinedExchanges(plan).isEmpty,
+        s"no exchange of a plan reading a CTE reuse stage may be pipelined; plan:\n$plan")
+      // The second collect of the same DataFrame must succeed with the same rows.
+      assert(run() === expected)
+    }
+  }
+}

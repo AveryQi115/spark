@@ -26,6 +26,7 @@ import scala.util.control.NonFatal
 import org.apache.spark.{ErrorMessageFormat, JobArtifactSet, JobArtifactState, SparkContext, SparkEnv, SparkException, SparkThrowable, SparkThrowableHelper}
 import org.apache.spark.SparkContext.{SPARK_JOB_DESCRIPTION, SPARK_JOB_INTERRUPT_ON_CANCEL}
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.{EXECUTION_ID, SHUFFLE_ID}
 import org.apache.spark.internal.config.{SPARK_DRIVER_PREFIX, SPARK_EXECUTOR_PREFIX}
 import org.apache.spark.internal.config.Tests.IS_TESTING
 import org.apache.spark.sql.classic.SparkSession
@@ -121,6 +122,163 @@ object SQLExecution extends Logging {
   }
 
   /**
+   * Best-effort cleanup of the shuffle dependencies produced by `queryExecution`, invoked from
+   * `withNewExecutionId0`'s `finally` while the `SparkContext` may be tearing down (`removeShuffle`
+   * can reach a stopped `BlockManagerMaster`, `SparkEnv.get` can be null). Each shuffle is cleaned
+   * independently and non-fatal failures are logged rather than propagated, so one failure does not
+   * abandon the rest; an `InterruptedException` is not `NonFatal` and still propagates. The log is
+   * mode-specific: for `RemoveShuffleFiles` a failure may leak the shuffle's files on disk, while
+   * `SkipMigration` only marks the shuffle to skip decommission migration and keeps its files by
+   * design.
+   */
+  private[execution] def cleanupShuffleDependencies(
+      queryExecution: QueryExecution,
+      executionId: Long): Unit = {
+    val sc = queryExecution.sparkSession.sparkContext
+    try {
+      val shuffleIds = queryExecution.executedPlan match {
+        case command: V2CommandExec =>
+          command.children.flatMap(extractShuffleIds)
+        case dataWritingCommand: DataWritingCommandExec =>
+          extractShuffleIds(dataWritingCommand.child)
+        case plan =>
+          extractShuffleIds(plan)
+      }
+      shuffleIds.foreach { shuffleId =>
+        queryExecution.shuffleCleanupMode match {
+          case RemoveShuffleFiles =>
+            try {
+              // Same as ContextCleaner.doCleanupShuffle, but do not unregister the shuffle on
+              // MapOutputTracker so that stage retries would be triggered. Blocking is
+              // Utils.isTesting to deflake unit tests.
+              sc.shuffleDriverComponents.removeShuffle(shuffleId, Utils.isTesting)
+            } catch {
+              case NonFatal(e) =>
+                logWarning(log"Failed to remove shuffle ${MDC(SHUFFLE_ID, shuffleId)} for " +
+                  log"execution ${MDC(EXECUTION_ID, executionId)}; its files may be left " +
+                  log"on disk.", e)
+            }
+          case SkipMigration =>
+            try {
+              SparkEnv.get.blockManager.migratableResolver.addShuffleToSkip(shuffleId)
+            } catch {
+              case NonFatal(e) =>
+                logWarning(log"Failed to mark shuffle ${MDC(SHUFFLE_ID, shuffleId)} to skip " +
+                  log"migration for execution ${MDC(EXECUTION_ID, executionId)}.", e)
+            }
+          case _ => // this should not happen
+        }
+      }
+    } catch {
+      // `queryExecution.executedPlan` re-throws the planning failure cached in its `LazyTry`.
+      case NonFatal(e) =>
+        logWarning(log"Failed to clean up shuffle dependencies for execution " +
+          log"${MDC(EXECUTION_ID, executionId)}.", e)
+    }
+  }
+
+  /**
+   * The state of one execution id in [[sharedCTEPlanStates]]: whether the execution has ended, and
+   * how many shared inner CTE plans that run under its id are still materializing.
+   */
+  private[sql] case class SharedCTEPlanState(ended: Boolean, pending: Int)
+
+  /**
+   * Execution-scoped registry of the shared inner CTE plans that run under each execution id (see
+   * `AdaptiveSparkPlanExec.materialize`), whatever adaptive execution context holds them, a cached
+   * relation's included. Such a plan is not cancelled with its query, so it can still be submitting
+   * jobs under the id of an execution that has ended and released the scheduler's per-query job
+   * entries of that id; when it finishes, it releases them once more. The registry holds an entry
+   * for each running execution, and for each ended execution while a shared inner CTE plan that
+   * runs under its id is still materializing, so it stays bounded by the running executions and the
+   * inner plans in flight. Each update of an entry is one atomic operation on its id.
+   */
+  private[sql] val sharedCTEPlanStates = new ConcurrentHashMap[Long, SharedCTEPlanState]()
+
+  /** Adds the entry of a starting execution, marked running. */
+  private[sql] def registerExecutionForSharedCTEPlans(executionId: Long): Unit = {
+    sharedCTEPlanStates.put(executionId, SharedCTEPlanState(ended = false, pending = 0))
+  }
+
+  /**
+   * Handles the end of `executionId`: removes its entry when no shared inner CTE plan that runs
+   * under its id is still materializing, and otherwise marks it ended, so that each such plan
+   * releases the scheduler's per-query job entries of the id again when it finishes. Must be called
+   * before the execution posts its own job cleanup. Idempotent.
+   */
+  private[sql] def recordExecutionEndForSharedCTEPlans(executionId: Long): Unit = {
+    sharedCTEPlanStates.computeIfPresent(executionId, (_, state) =>
+      if (state.pending == 0) null else state.copy(ended = true))
+  }
+
+  /**
+   * Registers a shared inner CTE plan that starts materializing under `executionId`. Must be called
+   * before the plan submits its first job. An id without an entry belongs to an execution that has
+   * already ended, for example when a thread that still carries the id forces the plan afterwards.
+   */
+  private[sql] def sharedCTEPlanStarted(executionId: Long): Unit = {
+    sharedCTEPlanStates.compute(executionId, (_, state) =>
+      if (state == null) {
+        SharedCTEPlanState(ended = true, pending = 1)
+      } else {
+        state.copy(pending = state.pending + 1)
+      })
+  }
+
+  /**
+   * Called when a shared inner CTE plan that [[sharedCTEPlanStarted]] registered under
+   * `executionId` finishes, successfully or not. When the execution has ended, the plan may have
+   * registered jobs under its id after the execution's own job cleanup, so this releases the
+   * scheduler's per-query job entries of the id once more. Each stage submission of the plan is
+   * posted to the scheduler's event loop before its materialization completes, and the execution's
+   * end updates its entry before its own cleanup is posted, so whichever of the two cleanups is
+   * posted last is handled after every job the plan registered. The exception is work that a
+   * replan of the plan drops without cancelling it or waiting for it: a broadcast stage, the
+   * subqueries that a dropped shuffle stage starts while it prepares, which cancelling the stage
+   * does not stop, and a delegated shuffle that cannot be cancelled before it is submitted. Jobs
+   * that such work submits can register after both cleanups, as such dropped work of any
+   * adaptive plan can.
+   */
+  private[sql] def sharedCTEPlanFinished(sc: SparkContext, executionId: Long): Unit = {
+    var ended = false
+    sharedCTEPlanStates.computeIfPresent(executionId, (_, state) => {
+      ended = state.ended
+      val pending = state.pending - 1
+      if (state.ended && pending == 0) null else state.copy(pending = pending)
+    })
+    if (ended) {
+      try {
+        Option(sc.dagScheduler).foreach(_.cleanupQueryJobs(executionId))
+      } catch {
+        case NonFatal(e) =>
+          logWarning(log"Failed to clean up the jobs of ended execution " +
+            log"${MDC(EXECUTION_ID, executionId)} after a shared CTE plan finished.", e)
+      }
+    }
+  }
+
+  private[sql] val NONE_EXPLAIN_MODE = "none"
+
+  private[sql] val NO_PLAN_DESCRIPTION =
+    s"No plan description because ${SQLConf.UI_EXPLAIN_MODE.key}=$NONE_EXPLAIN_MODE"
+
+  /**
+   * Returns the plan description carried by the SQL UI events, or a placeholder when the UI
+   * explain mode is `none`, in which case the explain string, which is expensive to build for
+   * large plans, is not generated at all.
+   *
+   * `none` is intentionally not an [[ExplainMode]]: it only makes sense for the UI events, and
+   * keeping it here avoids making `df.explain("none")` a valid public API.
+   */
+  private[sql] def planDescription(qe: QueryExecution, uiExplainMode: String): String = {
+    if (uiExplainMode.equalsIgnoreCase(NONE_EXPLAIN_MODE)) {
+      NO_PLAN_DESCRIPTION
+    } else {
+      qe.explainString(ExplainMode.fromString(uiExplainMode))
+    }
+  }
+
+  /**
    * Wrap an action that will execute "queryExecution" to track all Spark jobs in the body so that
    * we can connect them with an execution.
    */
@@ -154,6 +312,7 @@ object SQLExecution extends Logging {
       executionId
     }
     executionIdToQueryExecution.put(executionId, queryExecution)
+    registerExecutionForSharedCTEPlans(executionId)
     val originalInterruptOnCancel = sc.getLocalProperty(SPARK_JOB_INTERRUPT_ON_CANCEL)
     if (originalInterruptOnCancel == null) {
       val interruptOnCancel = sparkSession.sessionState.conf.getConf(SQLConf.INTERRUPT_ON_CANCEL)
@@ -209,9 +368,8 @@ object SQLExecution extends Logging {
                   sc.listenerBus.post(startEvent)
                   throw e
                 case Right(f) =>
-                  val planDescriptionMode =
-                    ExplainMode.fromString(sparkSession.sessionState.conf.uiExplainMode)
-                  val planDesc = queryExecution.explainString(planDescriptionMode)
+                  val planDesc = planDescription(
+                    queryExecution, sparkSession.sessionState.conf.uiExplainMode)
                   val planInfo = try {
                     SparkPlanInfo.fromSparkPlan(queryExecution.executedPlan)
                   } catch {
@@ -232,73 +390,88 @@ object SQLExecution extends Logging {
                 ex = Some(e)
                 throw e
             } finally {
-              val endTime = System.nanoTime()
-              val errorMessage = ex.map {
-                case e: SparkThrowable =>
-                  SparkThrowableHelper.getMessage(e, ErrorMessageFormat.PRETTY)
-                case e =>
-                  Utils.exceptionString(e)
-              }
-              if (queryExecution.shuffleCleanupMode != DoNotCleanup
-                && isExecutedPlanAvailable) {
-                val shuffleIds = queryExecution.executedPlan match {
-                  case command: V2CommandExec =>
-                    command.children.flatMap(extractShuffleIds)
-                  case dataWritingCommand: DataWritingCommandExec =>
-                    extractShuffleIds(dataWritingCommand.child)
-                  case plan =>
-                    extractShuffleIds(plan)
-                }
-                shuffleIds.foreach { shuffleId =>
-                  queryExecution.shuffleCleanupMode match {
-                    case RemoveShuffleFiles =>
-                      // Same as what we do in ContextCleaner.doCleanupShuffle, but do not
-                      // unregister the shuffle on MapOutputTracker, so that stage retries would be
-                      // triggered.
-                      // Set blocking to Utils.isTesting to deflake unit tests.
-                      sc.shuffleDriverComponents.removeShuffle(shuffleId, Utils.isTesting)
-                    case SkipMigration =>
-                      SparkEnv.get.blockManager.migratableResolver.addShuffleToSkip(shuffleId)
-                    case _ => // this should not happen
+              // `SparkContext.stop()` nulls `dagScheduler` before it stops the listener bus, so the
+              // end event may still be posted after the scheduler is unavailable. Keep observation
+              // completion in a `finally` so an error in this block never leaves a waiter hung.
+              try {
+                val endTime = System.nanoTime()
+                val errorMessage = ex.map { e =>
+                  try {
+                    e match {
+                      case st: SparkThrowable =>
+                        SparkThrowableHelper.getMessage(st, ErrorMessageFormat.PRETTY)
+                      case _ =>
+                        Utils.exceptionString(e)
+                    }
+                  } catch {
+                    // Rendering a user throwable can itself throw (e.g. a custom `getMessage`).
+                    // Fall back to a safe value so the query's real failure is still surfaced and
+                    // the cleanup, event post and observation completion below still run.
+                    case NonFatal(t) =>
+                      logWarning(log"Failed to render the error message for execution " +
+                        log"${MDC(EXECUTION_ID, executionId)}.", t)
+                      e.getClass.getName
                   }
                 }
+                if (queryExecution.shuffleCleanupMode != DoNotCleanup && isExecutedPlanAvailable) {
+                  cleanupShuffleDependencies(queryExecution, executionId)
+                }
+                val event = SparkListenerSQLExecutionEnd(
+                  executionId,
+                  System.currentTimeMillis(),
+                  // Use empty string to indicate no error, as None may mean events generated by old
+                  // versions of Spark.
+                  errorMessage.orElse(Some("")),
+                  Some(queryId))
+                // Currently only `Dataset.withAction` and `DataFrameWriter.runCommand` specify the
+                // `name` parameter. The `ExecutionListenerManager` only watches SQL executions with
+                // name. We can specify the execution name in more places in the future, so that
+                // `QueryExecutionListener` can track more cases.
+                event.executionName = name
+                event.duration = endTime - startTime
+                event.qe = queryExecution
+                event.executionFailure = ex
+                // Snapshot the `@volatile` `dagScheduler` once and share it across both reads
+                // below; it is null once `SparkContext.stop()` has run.
+                val dagSchedulerOpt = Option(sc.dagScheduler)
+                if (Utils.isTesting) {
+                  import scala.jdk.CollectionConverters._
+                  // Only runs under `Utils.isTesting`; hits the same teardown race as the job
+                  // cleanup below.
+                  event.jobIds = dagSchedulerOpt
+                    .flatMap(ds => Option(ds.activeQueryToJobs.get(executionId)))
+                    .map(_.asScala.map(_.jobId).toSet)
+                    .getOrElse(Set.empty)
+                }
+
+                // A shared inner CTE plan can outlive this execution and register jobs under its
+                // id after the cleanup below. Record the end first, so that such a plan releases
+                // them again when it finishes.
+                recordExecutionEndForSharedCTEPlans(executionId)
+                // Clean up jobs tracked by DAGScheduler for this query execution.
+                dagSchedulerOpt.foreach(_.cleanupQueryJobs(executionId))
+
+                sc.listenerBus.post(event)
+              } finally {
+                // Complete the observation whatever the block above threw, so an `Observation.get`
+                // waiter is never left hung. `promise.tryComplete` is idempotent.
+                try {
+                  sparkSession.observationManager.tryComplete(queryExecution)
+                } catch {
+                  case NonFatal(e) =>
+                    logWarning(log"Failed to complete observations for execution " +
+                      log"${MDC(EXECUTION_ID, executionId)}.", e)
+                }
               }
-              val event = SparkListenerSQLExecutionEnd(
-                executionId,
-                System.currentTimeMillis(),
-                // Use empty string to indicate no error, as None may mean events generated by old
-                // versions of Spark.
-                errorMessage.orElse(Some("")),
-                Some(queryId))
-              // Currently only `Dataset.withAction` and `DataFrameWriter.runCommand` specify the
-              // `name` parameter. The `ExecutionListenerManager` only watches SQL executions with
-              // name. We can specify the execution name in more places in the future, so that
-              // `QueryExecutionListener` can track more cases.
-              event.executionName = name
-              event.duration = endTime - startTime
-              event.qe = queryExecution
-              event.executionFailure = ex
-              if (Utils.isTesting) {
-                import scala.jdk.CollectionConverters._
-                event.jobIds = Option(sc.dagScheduler.activeQueryToJobs.get(executionId))
-                  .map(_.asScala.map(_.jobId).toSet)
-                  .getOrElse(Set.empty)
-              }
-
-              // Clean up jobs tracked by DAGScheduler for this query execution.
-              sc.dagScheduler.cleanupQueryJobs(executionId)
-
-              sc.listenerBus.post(event)
-
-              // Observation.tryComplete is called here to ensure the observation is completed,
-              // but it is not high priority, so it is fine to call it later.
-              sparkSession.observationManager.tryComplete(queryExecution)
             }
           }
         }
       }
     } finally {
       executionIdToQueryExecution.remove(executionId)
+      // Normally a no-op: the end above has already been recorded. This keeps the entry from
+      // outliving an execution whose end handling above did not run.
+      recordExecutionEndForSharedCTEPlans(executionId)
       sc.setLocalProperty(EXECUTION_ID_KEY, oldExecutionId)
       sc.setLocalProperty(QUERY_ID_KEY, oldQueryId)
       // Unset the "root" SQL Execution Id once the "root" SQL execution completes.
